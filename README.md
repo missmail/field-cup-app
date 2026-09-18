@@ -1,3 +1,3 @@
 # Beesline Field Cup — deployed app
 
-Static build published from the private source repo `missmail/field-cup` (commit 36f4a1c). Do not edit here.
+Static build published from the private source repo `missmail/field-cup` (commit eb7657d). Do not edit here.
