@@ -559,6 +559,7 @@
       <button class="btn" id="btnReport" style="flex:0 0 auto; width:auto; padding:9px 13px; font-size:13px">⬇︎ PDF report</button>
     </div>
     <div class="chrono" id="chronoCard" hidden></div>
+    <div class="chrono pre" id="finishCard" hidden></div>
     <div class="prog">
       <div class="stat"><div class="k">Completed</div><div class="v"><span id="stCompleted" class="num">0</span><small id="stTotal">/0</small></div>
         <div class="bar"><i id="stBar" style="width:0%"></i></div></div>
@@ -585,6 +586,7 @@
   <!-- BOARD -->
   <section class="view" id="view-board">
     <div class="vhead"><div><h2>Leaderboard</h2><div class="sub">Live standings · all 3 teams</div></div></div>
+    <div class="chrono pre" id="finishCardBoard" hidden></div>
     <div class="board" id="boardList"></div>
   </section>
 
@@ -1235,15 +1237,36 @@ function renderDoors(){
   }).join("");
   el.querySelectorAll(".door").forEach(b=> b.addEventListener("click",()=>openDoor(b.dataset.door, viewTeam)));
   renderChrono();
+  renderFinishCard();
 }
 
 /* ---------------- RENDER: board ---------------- */
+/* FR-52: publishing the results is what members see here — a banner naming the winner. And while
+   config.event.show_leaderboard is off, a member's board is held back "until the reveal" (supervisors
+   and admins keep seeing it), which is why Publish also switches that flag back on. */
+function boardResultsBanner(rows){
+  const top=rows[0]; if(!top) return "";
+  const tied=rows.filter(r=> r.pts===top.pts && r.done===top.done && r.fin===top.fin);   // level on points, doors and completion time
+  const title= top.pts<=0? "🏆 Final results" : tied.length>1? "🏆 Tie for first" : "🏆 "+teamDisplayName(top.t)+" wins";
+  return '<div class="chrono pre" style="margin-bottom:2px"><div class="cl"><div class="ctitle">'+esc(title)+'</div>'+
+    '<div class="clk num">'+top.pts.toLocaleString()+'<small style="font-size:13px; color:var(--muted); font-family:var(--fs-ui); font-weight:600"> pts</small></div>'+
+    '<div class="csub">Final results · '+esc(tied.map(r=>teamDisplayName(r.t)).join(" · "))+' · '+top.done+'/'+top.total+' doors</div></div></div>';
+}
 function renderBoard(){
   const rows=Object.keys(GROUPS).map(t=>({t:+t, g:GROUPS[t], pts:teamPoints(+t), done:teamDone(+t),
     total:DOORS.filter(d=>d.team===+t).length, fin:teamFinishTs(+t)}));
   rows.sort((a,b)=> b.pts-a.pts || b.done-a.done || a.fin-b.fin);   // points → doors done → earliest completion
-  const max=Math.max(1, rows[0].pts);
-  document.getElementById("boardList").innerHTML=rows.map((r,i)=>{
+  const ev=CFG.event||{}, published= ev.results_published===true;
+  const hidden= !!ME && ME.role==="member" && ev.show_leaderboard===false;
+  const sub=document.querySelector("#view-board .vhead .sub");
+  if(sub) sub.textContent= hidden? "Hidden until the reveal" : (published? "Final results · published" : "Live standings · "+rows.length+" teams");
+  if(hidden){
+    document.getElementById("boardList").innerHTML=
+      '<div class="empty">🏆<div style="margin-top:8px">The leaderboard is hidden until the reveal.<br>Keep auditing — every point still counts.</div></div>';
+    renderFinishCard(); return;
+  }
+  const max=Math.max(1, rows.length? rows[0].pts : 0);
+  document.getElementById("boardList").innerHTML=(published? boardResultsBanner(rows) : "")+rows.map((r,i)=>{
     const lead=i===0 && r.pts>0;
     return '<div class="brow'+(lead?" lead":"")+'">'+
       '<div class="rank num">'+(i+1)+'</div>'+
@@ -1254,6 +1277,7 @@ function renderBoard(){
       '<div class="tp num">'+r.pts.toLocaleString()+'<small>points</small></div>'+
       '<div class="tbar" style="width:'+(r.pts/max*100)+'%; background:'+r.g.color+'"></div></div>';
   }).join("");
+  renderFinishCard();
 }
 
 /* ---------------- RENDER: map ---------------- */
@@ -2898,6 +2922,712 @@ ADMIN_ACTIONS.monManage=function(el){ monManageSheet(el.dataset.door, +el.datase
 ADMIN_ACTIONS.monRetry=function(){ monErr=null; renderAdminPage(); };
 ADMIN_PAGES.monitor.render=renderAdminMonitor;   // live (default): realtime pushes redraw; no inputs on the page
 
+/* ---- System (12-ADMIN §11, FR-57) — backend + realtime health, versions, audit log viewer, locked-devices note.
+   Read-only page: nothing here writes app data. The audit log and the service-worker registration are fetched
+   when this page opens, never at boot — same load-on-entry / spinner-then-retry shape as Live Monitor (§8). */
+let SYS_LOG=null, sysLogLoading=false, sysLogErr=null, sysLogFilter="", sysLogAt=0;
+let SYS_SW=null, sysSwLoading=false, sysSwErr=null;
+let sysOffsetAt=null;   // ms wall-clock time of the last manual re-measure; null = only the boot measurement from Store.init()
+function sysOnPage(){ return adminActive() && adminPage==="system"; }
+async function loadSysLog(){
+  if(sysLogLoading) return;
+  if(!Store.online()){ SYS_LOG=[]; return; }   // offline demo: audit_log is server-only, nothing to show
+  sysLogLoading=true; sysLogErr=null;
+  try{ SYS_LOG=await Store.listAuditLog(200); sysLogAt=Date.now(); }
+  catch(e){ console.error(e); sysLogErr=friendlyErr(e, "Couldn’t load the audit log"); }
+  finally{ sysLogLoading=false; if(sysOnPage()) renderAdminPage(); }
+}
+async function loadSysSW(){
+  if(sysSwLoading) return;
+  if(!("serviceWorker" in navigator)){ SYS_SW={supported:false}; return; }
+  sysSwLoading=true; sysSwErr=null;
+  try{
+    const reg=await navigator.serviceWorker.getRegistration();
+    SYS_SW= reg? {supported:true, scope:reg.scope, active:(reg.active&&reg.active.state)||null, waiting:!!reg.waiting, installing:!!reg.installing}
+               : {supported:true, scope:null};
+  }catch(e){ console.error(e); sysSwErr=friendlyErr(e, "Couldn’t read the service worker"); }
+  finally{ sysSwLoading=false; if(sysOnPage()) renderAdminPage(); }
+}
+function sysBackend(){   // host + project ref only, parsed from SUPABASE_URL — the anon key is never read or shown here
+  try{ const u=new URL(SUPABASE_URL); return {host:u.host, ref:(u.host.split(".")[0])||"—"}; }
+  catch(e){ return {host:"—", ref:"—"}; }
+}
+function sysOffsetLabel(){
+  const ms=Math.round(SERVER_OFFSET||0), abs=Math.abs(ms), num= abs<1000? ms+" ms" : (ms/1000).toFixed(2)+" s";
+  if(ms>0) return "+"+num+" — device behind server";
+  if(ms<0) return num+" — device ahead of server";
+  return "0 ms — in sync";
+}
+function sysSwPill(){
+  if(sysSwErr) return {cls:"bad", label:"Couldn’t read"};
+  if(SYS_SW===null) return {cls:"todo", label:"Checking…"};
+  if(!SYS_SW.supported) return {cls:"todo", label:"Not supported here"};
+  if(!SYS_SW.scope) return {cls:"todo", label:"Not registered"};
+  if(SYS_SW.waiting) return {cls:"part", label:"Update waiting"};
+  if(SYS_SW.installing) return {cls:"part", label:"Installing"};
+  if(SYS_SW.active==="activated") return {cls:"done", label:"Active"};
+  return {cls:"todo", label:SYS_SW.active||"Unknown"};
+}
+function sysLogActions(){
+  const seen={}, out=[];
+  (SYS_LOG||[]).forEach(l=>{ const a=l&&l.action; if(a && !seen[a]){ seen[a]=1; out.push(a); } });
+  return out.sort();
+}
+function sysLogRow(l){
+  const t=l.ts? new Date(l.ts).getTime() : NaN;
+  return '<li><span class="ic log">!</span><div class="t"><b>'+esc(l.actor||"—")+'</b> '+esc(String(l.action||"—").replace(/_/g," "))+
+    (l.target? ' <b>'+esc(l.target)+'</b>' : '')+(l.role? ' <span class="r">· '+esc(l.role)+'</span>' : '')+
+    (l.reason? ' <span class="r">— '+esc(l.reason)+'</span>' : '')+'</div><span class="when">'+(isNaN(t)?"—":esc(relTime(t)))+'</span></li>';
+}
+function sysLogList(){
+  const rows=(SYS_LOG||[]).filter(l=>!sysLogFilter || l.action===sysLogFilter);
+  if(!rows.length) return '<div class="note" style="margin-top:6px">'+(sysLogFilter? "No "+esc(sysLogFilter.replace(/_/g," "))+" entries." : "Nothing logged yet — status changes and admin overrides show up here.")+'</div>';
+  return '<ul class="mon-feed">'+rows.map(sysLogRow).join("")+'</ul>';
+}
+function renderAdminSystem(el){
+  if(SYS_LOG===null && !sysLogLoading && !sysLogErr) loadSysLog();
+  else if(SYS_LOG!==null && !sysLogLoading && !sysLogErr && Date.now()-sysLogAt>MON_POLL_MS) loadSysLog();   // keeps the log from going stale across re-entries, same cadence as Live Monitor
+  if(SYS_SW===null && !sysSwLoading && !sysSwErr) loadSysSW();
+  const online=Store.online(), b=sysBackend(), sw=sysSwPill(), lastWrite=monLastWrite(), actions=sysLogActions();
+  const segHtml='<div class="seg" style="margin-bottom:10px">'+
+    '<button type="button" data-act="sysFilter" data-val="" aria-pressed="'+(sysLogFilter===""?"true":"false")+'">All</button>'+
+    actions.map(a=>'<button type="button" data-act="sysFilter" data-val="'+esc(a)+'" aria-pressed="'+(sysLogFilter===a?"true":"false")+'">'+esc(a.replace(/_/g," "))+'</button>').join("")+
+  '</div>';
+  el.innerHTML=
+    '<div class="kpis">'+
+      kpi("Backend", online? "Online" : "Offline", "store "+esc(Store.getMode()))+
+      kpi("Realtime", online? (subsStarted? "Started" : "Not started") : "—", online? (photosSubStarted? "+ photos started" : "photos: not opened yet") : "offline mode uses local polling")+
+      kpi("Last write", lastWrite? esc(relTime(lastWrite)) : "—", lastWrite? "audit save or photo" : "nothing saved yet")+
+      kpi("Clock drift", (Math.abs(SERVER_OFFSET||0)<1000? Math.round(SERVER_OFFSET||0)+" ms" : (SERVER_OFFSET/1000).toFixed(2)+" s"), sysOffsetAt? "re-measured "+esc(relTime(sysOffsetAt)) : "measured at app start")+
+    '</div>'+
+    '<div class="adm-card"><h3>Backend</h3><div class="prof" style="margin-top:6px">'+
+      '<div class="row"><span>Host</span><b>'+esc(b.host)+'</b></div>'+
+      '<div class="row"><span>Project ref</span><b>'+esc(b.ref)+'</b></div>'+
+      '<div class="row"><span>Store mode</span><b>'+esc(Store.getMode())+'</b></div>'+
+      '<div class="row"><span>Online</span><b>'+(online? '<span class="pill done"><span class="pd"></span>Yes</span>' : '<span class="pill bad"><span class="pd"></span>No</span>')+'</b></div>'+
+      '<div class="row"><span>Config source</span><b>'+esc(CONFIG_SOURCE)+'</b></div>'+
+    '</div></div>'+
+    '<div class="adm-card"><h3>Realtime &amp; clock</h3><div class="prof" style="margin-top:6px">'+
+      '<div class="row"><span>Audits · teams · config</span><b>'+(!online? '<span class="pill todo"><span class="pd"></span>Offline — polling</span>' : subsStarted? '<span class="pill done"><span class="pd"></span>Started</span>' : '<span class="pill todo"><span class="pd"></span>Not started</span>')+'</b></div>'+
+      '<div class="row"><span>Photos</span><b>'+(!online? '<span class="pill todo"><span class="pd"></span>Offline — polling</span>' : photosSubStarted? '<span class="pill done"><span class="pd"></span>Started</span>' : '<span class="pill todo"><span class="pd"></span>Not opened yet</span>')+'</b></div>'+
+      '<div class="row"><span>Last write</span><b>'+(lastWrite? esc(relTime(lastWrite)) : "—")+'</b></div>'+
+      '<div class="row"><span>Clock drift</span><b>'+esc(sysOffsetLabel())+'</b></div>'+
+    '</div>'+
+    '<div class="note">“Started” means the subscriptions were set up at login, not that a realtime channel is confirmed connected — this build does not track per-channel connection state.</div>'+
+    '<div class="btnrow" style="margin-top:12px"><button class="btn" data-act="sysRemeasure">Re-measure clock</button></div>'+
+    '</div>'+
+    '<div class="adm-card"><h3>Versions</h3><div class="prof" style="margin-top:6px">'+
+      '<div class="row"><span>App build</span><b>None found</b></div>'+
+      '<div class="row"><span>Service worker</span><b><span class="pill '+sw.cls+'"><span class="pd"></span>'+esc(sw.label)+'</span></b></div>'+
+      (SYS_SW&&SYS_SW.scope? '<div class="row"><span>SW scope</span><b>'+esc(SYS_SW.scope)+'</b></div>' : '')+
+    '</div>'+
+    '<div class="note">No build stamp exists in index.html yet, so none is shown here rather than a guess.</div>'+
+    (sysSwErr? '<div class="warnnote">'+esc(sysSwErr)+'</div>' : '')+
+    '<div class="btnrow" style="margin-top:12px"><button class="btn" data-act="sysCheckUpdate">Check for update</button></div>'+
+    '</div>'+
+    '<div class="adm-card"><h3>Locked devices</h3><div class="sub">5 wrong PINs from one device within 15 minutes locks that device out (FR-75)</div>'+
+      '<div class="note" style="margin-top:8px">This build’s live database has no client-readable table or RPC for login attempts — row-level security is on with no policies, so no client, including this admin panel, can list or clear a lock. A lock clears itself automatically 15 minutes after the 5th wrong PIN. To clear one sooner, an admin runs a query directly in the Supabase SQL editor.</div>'+
+    '</div>'+
+    '<div class="adm-card"><div class="ghead"><b>Audit log</b><span class="cnt">Most recent 200 rows · newest first'+(online?"":" · needs the online backend")+'</span>'+
+      '<button class="btn" data-act="sysLogRetry">Refresh</button></div>'+
+      // Keep the control whenever a filter is on, even if nothing matches — otherwise filtering to an
+      // action and then wiping the log hides 'All' too, and there is no way back without leaving the page.
+      ((actions.length || sysLogFilter)? segHtml : '')+
+      (sysLogErr? '<div class="warnnote" style="margin-top:0">'+esc(sysLogErr)+'</div><div class="btnrow" style="margin-top:10px"><button class="btn" data-act="sysLogRetry">Retry</button></div>'
+        : SYS_LOG===null? '<div class="skel" style="width:40%"></div><div class="skel"></div><div class="skel" style="width:80%"></div>'
+        : sysLogList())+
+    '</div>';
+}
+ADMIN_ACTIONS.sysLogRetry=function(){ sysLogErr=null; SYS_LOG=null; renderAdminPage(); };
+ADMIN_ACTIONS.sysFilter=function(el){ sysLogFilter=el.dataset.val||""; renderAdminPage(); };
+ADMIN_ACTIONS.sysRemeasure=function(){
+  if(adminOffline()) return;
+  return Store.serverNow().then(t=>{ SERVER_OFFSET=t-Date.now(); sysOffsetAt=t; toast("Clock re-measured"); renderAdminPage(); })
+    .catch(e=>{ console.error(e); toast(friendlyErr(e, "Couldn’t reach the server clock")); });
+};
+ADMIN_ACTIONS.sysCheckUpdate=async function(){
+  if(!("serviceWorker" in navigator)){ toast("This browser has no service worker support"); return; }
+  try{
+    const reg=await navigator.serviceWorker.getRegistration();
+    if(!reg){ toast("No service worker registered yet"); return; }
+    await reg.update();
+    if(reg.waiting) swOfferReload(reg.waiting);
+    else if(reg.installing) toast("Update installing — a reload prompt will follow shortly");
+    else toast("Already on the latest version");
+  }catch(e){ console.error(e); toast(friendlyErr(e, "Couldn’t check for update")); }
+  finally{ SYS_SW=null; sysSwErr=null; loadSysSW(); }
+};
+ADMIN_PAGES.system.render=renderAdminSystem;
+
+/* ---- Results (§10, FR-52) — final ranking with the tie-break in words, per-team breakdown, per-door
+   tables, winner banner preview, Publish / Unpublish and a one-page ranking PDF for the reveal.
+   Everything is computed in memory from AUDITS + PTS (no fetch, no await on render). The only write on
+   this page is config.event through writeEventConfig(); publishing also turns the members' leaderboard
+   back on, because publishing into a hidden board would change nothing anyone can see. */
+function resPublished(){ return (CFG.event||{}).results_published===true; }
+function resBoardShown(){ return (CFG.event||{}).show_leaderboard!==false; }
+function resAuditParts(a){   // one door's points, split by the parts config.scoring defines — never a hard-coded 10/50/15/5
+  const p={answered:0, sections:0, all9:0, photos:0, text:0, bullets:0, speed:0, total:0};
+  if(!a) return p;
+  const answered=FIELDS.reduce((n,f)=> n + (a.fields && a.fields[f.id] ? 1:0), 0);
+  const filled=[a.keepDoing, a.stopDoing, a.opportunity].filter(v=> v && v.trim()).length;          // same test as qualityPointsA()
+  const bullets=(Array.isArray(a.competition)?a.competition.length:0)+(Array.isArray(a.insights)?a.insights.length:0);
+  p.answered=answered;
+  p.sections=answered*PTS.section;
+  p.all9= answered===TOTAL_SECTIONS? PTS.completion : 0;
+  p.photos=(a.photoCount||0)*PTS.photo;
+  p.text=filled*PTS.quality;                                                                        // text + bullets = qualityPointsFromParts()
+  p.bullets=bullets*PTS.bullet;
+  p.speed= a.lockedAt? (a.speedBonus||0) : 0;                                                       // only a Done-locked bonus counts
+  p.total=a.points||computePoints(a);                                                               // server truth when it is there
+  return p;
+}
+function resTeamParts(team){
+  const out={sections:0, all9:0, photos:0, text:0, bullets:0, speed:0, sum:0};
+  DOORS.filter(d=>d.team===team).forEach(d=>{
+    const p=resAuditParts(AUDITS[auditId(team,d.id)]);
+    out.sections+=p.sections; out.all9+=p.all9; out.photos+=p.photos; out.text+=p.text; out.bullets+=p.bullets; out.speed+=p.speed;
+  });
+  out.sum=out.sections+out.all9+out.photos+out.text+out.bullets+out.speed;
+  return out;
+}
+function resRanking(){   // fixed order (never configurable): points → doors completed → earliest completion
+  const rows=Object.keys(GROUPS).map(t=>({t:+t, g:GROUPS[t], pts:teamPoints(+t), done:teamDone(+t),
+    total:DOORS.filter(d=>d.team===+t).length, fin:teamFinishTs(+t)}));
+  rows.sort((a,b)=> b.pts-a.pts || b.done-a.done || a.fin-b.fin);
+  return rows;
+}
+function resFinishLabel(r){ return isFinite(r.fin)? monClock(r.fin) : "not finished"; }
+function resSeparator(a,b){   // which of the three keys actually put a above b
+  if(a.pts!==b.pts) return {key:"points", how:(a.pts-b.pts).toLocaleString()+" points ahead ("+a.pts.toLocaleString()+" vs "+b.pts.toLocaleString()+")"};
+  if(a.done!==b.done) return {key:"doors completed", how:a.pts.toLocaleString()+" points each — "+a.done+" doors completed vs "+b.done};
+  if(a.fin!==b.fin) return {key:"earliest completion", how:a.pts.toLocaleString()+" points and "+a.done+" doors each — finished "+resFinishLabel(a)+" vs "+resFinishLabel(b)};
+  return {key:null, how:"level on points, doors completed and completion time"};
+}
+function resTiedTop(rows){   // everyone level with the leader on all three keys
+  const top=rows[0]; if(!top) return [];
+  return rows.filter(r=> r.pts===top.pts && r.done===top.done && r.fin===top.fin);
+}
+function resTable(head, rows, align, minW){
+  const th=head.map((h,i)=>'<th style="text-align:'+(align[i]||"left")+';padding:0 10px 8px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700;white-space:nowrap">'+h+'</th>').join("");
+  const tb=rows.map(r=>'<tr>'+r.map((c,i)=>'<td style="text-align:'+(align[i]||"left")+';padding:9px 10px;font-size:13.5px;border-top:1px solid var(--line-2);white-space:nowrap">'+c+'</td>').join("")+'</tr>').join("");
+  return '<div style="overflow-x:auto;margin-top:10px"><table style="width:100%;border-collapse:collapse;min-width:'+(minW||460)+'px">'+
+    '<thead><tr>'+th+'</tr></thead><tbody>'+tb+'</tbody></table></div>';
+}
+function resDot(g){ return '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+esc(g.color)+';margin-right:7px;vertical-align:middle"></span>'; }
+function resWinnerCard(rows){
+  const top=rows[0];
+  if(!top || top.pts<=0){
+    return '<div class="adm-card"><div class="eyebrow">Winner banner preview</div><h3 style="margin-top:4px">Nothing to reveal yet</h3>'+
+      '<div class="sub" style="margin-top:6px">No team has scored a point. The banner fills in as audits come in.</div></div>';
+  }
+  const tied=resTiedTop(rows), names=tied.map(r=>teamDisplayName(r.t)).join("  ·  ");
+  const sub=tied.length>1
+    ? tied.length+" teams level on points, doors completed and completion time — the ranking cannot separate them"
+    : esc(top.g.name)+" · "+top.done+"/"+top.total+" doors · "+(isFinite(top.fin)? "finished "+resFinishLabel(top) : "route not finished");
+  return '<div class="adm-card" style="border-color:color-mix(in srgb,var(--good) 32%,var(--line));background:color-mix(in srgb,var(--good) 7%,var(--surface))">'+
+    '<div class="eyebrow">Winner banner preview</div>'+
+    '<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:8px">'+
+      '<div style="flex:1 1 220px;min-width:0"><div style="font-family:var(--fs-display);font-weight:700;font-size:26px;letter-spacing:-.01em;line-height:1.15">'+
+        (tied.length>1? "🏆 Tie for first" : "🏆 "+esc(names))+'</div>'+
+        '<div class="sub" style="margin-top:6px">'+(tied.length>1? esc(names)+' — '+sub : sub)+'</div></div>'+
+      '<div class="pts num" style="font-size:34px;flex:0 0 auto">'+top.pts.toLocaleString()+'<small style="font-size:12px">points</small></div>'+
+    '</div>'+
+    '<div class="note">This is what the room sees at the reveal. Members see it on their leaderboard once the results are published.</div></div>';
+}
+function resPublishCard(){
+  const pub=resPublished(), shown=resBoardShown(), st=eventStatus(), online=Store.online();
+  return '<div class="adm-card"><div class="ghead"><b>Publish</b>'+
+      '<span class="pill '+(pub?"done":"todo")+'"><span class="pd"></span>'+(pub? "Published" : "Not published")+'</span>'+
+      '<span class="cnt">config.event.results_published</span></div>'+
+    '<div class="sub">'+(pub
+      ? 'Members see the final standing and a “Final results” banner naming the winner on their Leaderboard tab.'
+      : 'Members see no final standing yet.'+(shown? ' Their leaderboard is live, so it keeps updating as audits land.' : ' Their leaderboard is hidden until the reveal — publishing turns it back on.'))+'</div>'+
+    '<div class="prof" style="margin-top:6px">'+
+      '<div class="row"><span>Results published</span><b>'+(pub? "Yes" : "No")+'</b></div>'+
+      '<div class="row"><span>Leaderboard shown to members</span><b>'+(shown? "Yes" : "Hidden until the reveal")+'</b></div>'+
+      '<div class="row"><span>Event status</span><b>'+esc(st.toUpperCase())+'</b></div>'+
+    '</div>'+
+    (st==="closed"? '' : '<div class="warnnote">The event is not Closed yet — audits still count, so a published ranking can still change. Close it on the <a href="#/admin/event">Event page</a> before the reveal.</div>')+
+    '<div class="adm-toolbar" style="margin:12px 0 0">'+
+      (pub? '<button class="btn" data-act="resUnpublish">Unpublish</button>' : '<button class="btn primary" data-act="resPublish">Publish results</button>')+
+      '<button class="btn" data-act="resPdf">Ranking PDF</button>'+
+    '</div>'+
+    (online? '' : '<div class="note">Offline demo — publishing needs the online backend.</div>')+'</div>';
+}
+function renderAdminResults(el){
+  const rows=resRanking();
+  if(!rows.length){ el.innerHTML='<div class="adm-card"><h3>No teams</h3><div class="sub" style="margin-top:6px">There is no active team to rank.</div></div>'; return; }
+  const totalDoors=DOORS.length, doneDoors=rows.reduce((n,r)=>n+r.done,0), allPts=rows.reduce((n,r)=>n+r.pts,0);
+  const tied=resTiedTop(rows);
+
+  const rankRows=rows.map((r,i)=>[
+    '<b class="num" style="font-family:var(--fs-display);font-size:17px">'+(i+1)+'</b>',
+    resDot(r.g)+'<b>'+esc(teamDisplayName(r.t))+'</b><span style="color:var(--muted)"> · '+esc((teamDisplayName(r.t)!==r.g.short? r.g.short+" · " : "")+r.g.name)+'</span>',
+    r.done+'<span style="color:var(--faint)">/'+r.total+'</span>',
+    esc(resFinishLabel(r)),
+    '<b class="num">'+r.pts.toLocaleString()+'</b>',
+  ]);
+  const gaps=rows.slice(1).map((r,i)=>{
+    const above=rows[i], s=resSeparator(above, r);
+    return '<li style="margin-bottom:5px">'+(s.key
+      ? '<b>'+esc(teamDisplayName(above.t))+'</b> over <b>'+esc(teamDisplayName(r.t))+'</b> on <b>'+esc(s.key)+'</b> — '+esc(s.how)
+      : '<b>'+esc(teamDisplayName(above.t))+'</b> and <b>'+esc(teamDisplayName(r.t))+'</b> are tied — '+esc(s.how))+'</li>';
+  }).join("");
+
+  const brkRows=rows.map(r=>{
+    const p=resTeamParts(r.t), off= p.sum!==r.pts;
+    return [ resDot(r.g)+'<b>'+esc(teamDisplayName(r.t))+'</b>',
+      '<span class="num">'+p.sections.toLocaleString()+'</span>', '<span class="num">'+p.all9.toLocaleString()+'</span>',
+      '<span class="num">'+p.photos.toLocaleString()+'</span>', '<span class="num">'+p.text.toLocaleString()+'</span>',
+      '<span class="num">'+p.bullets.toLocaleString()+'</span>', '<span class="num">'+p.speed.toLocaleString()+'</span>',
+      '<b class="num">'+r.pts.toLocaleString()+'</b>'+(off? '<span style="color:var(--warn)"> *</span>' : '') ];
+  });
+  const anyOff=rows.some(r=>resTeamParts(r.t).sum!==r.pts);
+
+  const teamCards=rows.map(r=>{
+    const doors=DOORS.filter(d=>d.team===r.t);
+    const drows=doors.map(d=>{
+      const a=AUDITS[auditId(r.t,d.id)], st=doorStatus(d.id, r.t), p=resAuditParts(a);
+      return [ '<b>'+esc(d.name)+'</b>'+(d.district? '<div style="font-size:11.5px;color:var(--muted);margin-top:2px">'+esc(d.district)+'</div>' : ''),
+        '<span class="pill '+st.s+'"><span class="pd"></span>'+esc(st.label)+'</span>'+(st.s==="part"? '<span style="color:var(--muted);font-size:12px"> '+st.answered+'/'+TOTAL_SECTIONS+'</span>' : ''),
+        '<span class="num">'+p.total.toLocaleString()+'</span>',
+        a && a.lockedAt? '<span class="num">+'+(a.speedBonus||0)+'</span>' : '<span style="color:var(--faint)">—</span>',
+        esc((a&&a.by)||"—") ];
+    });
+    return '<div class="adm-card"><div class="ghead"><span class="dot" style="background:'+esc(r.g.color)+'"></span><b>'+esc(teamDisplayName(r.t))+'</b>'+
+      '<span class="cnt">'+esc(r.g.name)+' · '+r.done+'/'+r.total+' doors · '+r.pts.toLocaleString()+' pts · '+(isFinite(r.fin)? "finished "+esc(resFinishLabel(r)) : "route not finished")+'</span></div>'+
+      resTable(["Door","Status","Points","Speed bonus","Audited by"], drows, ["left","left","right","right","left"], 520)+'</div>';
+  }).join("");
+
+  el.innerHTML=
+    '<div class="kpis">'+
+      kpi("Doors completed", doneDoors+'<small>/'+totalDoors+'</small>', '<div class="bar"><i style="width:'+(totalDoors? Math.round(doneDoors/totalDoors*100):0)+'%;background:var(--good)"></i></div>')+
+      kpi("Points on the board", allPts.toLocaleString(), rows.length+" teams")+
+      kpi("Leader", tied.length>1? "Tied" : esc(teamDisplayName(rows[0].t)), tied.length>1? tied.length+" teams level" : rows[0].pts.toLocaleString()+" points")+
+      kpi("Results", resPublished()? "Published" : "Held", resPublished()? "members see the final standing" : "members see no final standing")+
+    '</div>'+
+    resWinnerCard(rows)+
+    '<div class="adm-card"><h3>Final ranking</h3>'+
+      '<div class="sub">Points first. Level on points, the team with more doors completed wins; level on both, the team that finished its last door earliest wins. That order is fixed and not configurable.</div>'+
+      resTable(["#","Team","Doors","Last door","Points"], rankRows, ["center","left","right","right","right"], 460)+
+      (gaps? '<div class="sub" style="margin-top:12px"><b>What separated them</b></div><ul class="sub" style="margin:6px 0 0;padding-left:18px">'+gaps+'</ul>' : '')+
+      (tied.length>1? '<div class="warnnote">'+tied.length+' teams are level on all three keys — the tie-break cannot separate them. Edy decides the winner.</div>' : '')+
+    '</div>'+
+    '<div class="adm-card"><h3>Where the points came from</h3>'+
+      '<div class="sub">Each column is recomputed from the saved audits with the current scoring config: '+PTS.section+' per answered section, '+PTS.completion+' for all '+TOTAL_SECTIONS+', '+PTS.photo+' per photo, '+PTS.quality+' per text answer, '+PTS.bullet+' per bullet, plus the speed bonus locked at Done.</div>'+
+      resTable(["Team","Sections","All "+TOTAL_SECTIONS,"Photos","Text","Bullets","Speed","Total"], brkRows, ["left","right","right","right","right","right","right","right"], 560)+
+      (anyOff? '<div class="note">* The stored total differs from the sum of the columns — those audits were scored with different scoring values than the ones set now. The stored total is what counts.</div>' : '')+
+    '</div>'+
+    teamCards+
+    resPublishCard();
+}
+async function resSetPublished(next){
+  if(adminOffline()) return;                                   // toasts "Admin actions need the online backend"
+  const ev=CFG.event||{}, hidden= ev.show_leaderboard===false, st=eventStatus();
+  const body= next
+    ? "Members get the final standing on their Leaderboard tab, with a banner naming the winner."
+      +(hidden? " Their leaderboard is hidden right now, so publishing also switches “Show leaderboard to members” back on — otherwise nothing would change on their phones." : "")
+      +(st!=="closed"? " The event is not Closed yet, so audits still count and the published ranking can still change." : "")
+    : "The final-results banner disappears from the members' leaderboard. The leaderboard itself stays visible — switch “Show leaderboard to members” off on the Event page if you need it dark again.";
+  const ok=await adminConfirm({title: next? "Publish the results?" : "Unpublish the results?", sub:String(ev.name||""), body,
+    okLabel: next? "Publish results" : "Unpublish", danger:!next});
+  if(!ok) return;
+  try{
+    const nextEvent=Object.assign({}, CFG.event||{}, next? {results_published:true, show_leaderboard:true} : {results_published:false});
+    const done=await writeEventConfig(nextEvent, null, next? "Results published" : "Results unpublished");
+    if(!done) return;
+    if(Store.online()){
+      try{ await Store.rpc("log_action", {action: next? "results_published" : "results_unpublished", target:String(ev.name||"")||null, reason:null}); }
+      catch(e){ console.error(e && e.message); toast("Saved, but the audit-log entry failed"); }
+    }
+  }catch(e){ console.error(e && e.message); toast(friendlyErr(e, next? "Couldn’t publish — try again" : "Couldn’t unpublish — try again")); }
+  finally{ if(adminActive() && adminPage==="results") renderAdminPage(); }
+}
+/* one-page ranking PDF for the reveal — the team report (buildTeamPdf) is a different document */
+function resultsPdfName(){ return (String((CFG.event&&CFG.event.name)||"Field Cup")+" - final ranking.pdf").replace(/[^\w.\- ]/g,""); }
+function buildResultsPdf(){
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF({unit:"mm", format:"a4"});
+  const M=14, W=210, H=297; let y=M;
+  const rows=resRanking(), tied=resTiedTop(rows);
+  try{ doc.addImage(LOGO_FULL,"PNG", M, y, 42, 42*180/1000); }catch(e){}
+  y+=13;
+  doc.setFont("helvetica","bold"); doc.setFontSize(17); doc.setTextColor(25);
+  doc.text("Field Cup — Final Ranking", M, y); y+=7;
+  doc.setFont("helvetica","normal"); doc.setFontSize(10.5); doc.setTextColor(60);
+  doc.text(String((CFG.event&&CFG.event.name)||"")+"  ·  "+eventDateLabel()+"  ·  "+eventStatus().toUpperCase()+(resPublished()? "  ·  PUBLISHED" : "  ·  NOT PUBLISHED"), M, y); y+=5;
+  doc.setFontSize(9.5); doc.setTextColor(110);
+  doc.text("Ranked on points, then doors completed, then the earliest finish of the last door.", M, y); y+=6;
+  if(rows.length && rows[0].pts>0){
+    doc.setFont("helvetica","bold"); doc.setFontSize(13); doc.setTextColor(25);
+    const win= tied.length>1? "Tie for first: "+tied.map(r=>teamDisplayName(r.t)).join(" / ") : "Winner: "+teamDisplayName(rows[0].t)+"  —  "+rows[0].pts.toLocaleString()+" points";
+    doc.text(doc.splitTextToSize(win, W-2*M), M, y); y+=7;
+  }
+  doc.setDrawColor(210); doc.setLineWidth(0.3); doc.line(M,y,W-M,y); y+=6;
+  // table — rank, team, doors, then every scoring part, then the stored total
+  const cols=[{l:"#",w:8,a:"left"},{l:"Team",w:44,a:"left"},{l:"Doors",w:15,a:"right"},{l:"Sect.",w:16,a:"right"},
+    {l:"All "+TOTAL_SECTIONS,w:15,a:"right"},{l:"Photos",w:16,a:"right"},{l:"Text",w:14,a:"right"},
+    {l:"Bullets",w:16,a:"right"},{l:"Speed",w:15,a:"right"},{l:"Total",w:19,a:"right"}];
+  let x=M; const xs=cols.map(c=>{ const at= c.a==="right"? x+c.w : x; x+=c.w; return at; });
+  doc.setFont("helvetica","bold"); doc.setFontSize(8.5); doc.setTextColor(120);
+  cols.forEach((c,i)=> doc.text(c.l, xs[i], y, {align:c.a}));
+  y+=2; doc.setDrawColor(225); doc.line(M,y,W-M,y); y+=4.5;
+  const ROWH=6.4, room=Math.max(1, Math.floor((H-M-32-y)/ROWH));
+  rows.slice(0, room).forEach((r,i)=>{
+    const p=resTeamParts(r.t);
+    doc.setFont("helvetica", i===0? "bold":"normal"); doc.setFontSize(10); doc.setTextColor(i===0? 25 : 55);
+    const cells=[String(i+1), String(teamDisplayName(r.t)).slice(0,26), r.done+"/"+r.total, String(p.sections), String(p.all9),
+      String(p.photos), String(p.text), String(p.bullets), String(p.speed), r.pts.toLocaleString()];
+    cells.forEach((c,j)=> doc.text(c, xs[j], y, {align:cols[j].a}));
+    y+=ROWH; doc.setDrawColor(238); doc.line(M,y-2.2,W-M,y-2.2);
+  });
+  if(rows.length>room){ doc.setFont("helvetica","normal"); doc.setFontSize(9); doc.setTextColor(120); doc.text("+"+(rows.length-room)+" more team(s) — see the admin panel", M, y); y+=5; }
+  y+=2;
+  doc.setFont("helvetica","normal"); doc.setFontSize(9); doc.setTextColor(70);
+  rows.slice(1, room).forEach((r,i)=>{
+    const s=resSeparator(rows[i], r);
+    const line= s.key? "• "+teamDisplayName(rows[i].t)+" over "+teamDisplayName(r.t)+" on "+s.key+" — "+s.how
+                      : "• "+teamDisplayName(rows[i].t)+" and "+teamDisplayName(r.t)+" are tied — "+s.how;
+    const ls=doc.splitTextToSize(line, W-2*M);
+    if(y+ls.length*4>H-M-10) return;
+    doc.text(ls, M, y); y+=ls.length*4+1;
+  });
+  doc.setFontSize(8); doc.setTextColor(150);
+  doc.text("Generated "+new Date().toLocaleString()+(resPublished()? "" : "  ·  results not published yet"), M, H-M);
+  return doc;
+}
+async function exportResultsPdf(btn){
+  if(!(window.jspdf && window.jspdf.jsPDF)){ toast("PDF tool still loading — try again"); return; }
+  const old=btn? btn.textContent : "";
+  if(btn){ btn.disabled=true; btn.textContent="Building…"; }
+  try{
+    const res=await sharePDF(buildResultsPdf(), resultsPdfName());
+    toast(res==="shared"? "Shared ✓" : res==="cancel"? "Cancelled" : res==="fail"? "Couldn’t export the PDF" : "Ranking PDF ready ✓");
+  }catch(e){ console.error(e); toast("Ranking PDF failed — try again"); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent= old || "Ranking PDF"; } }
+}
+ADMIN_ACTIONS.resPublish=function(){ return resSetPublished(true); };
+ADMIN_ACTIONS.resUnpublish=function(){ return resSetPublished(false); };
+ADMIN_ACTIONS.resPdf=function(el){ return exportResultsPdf(el); };
+ADMIN_PAGES.results.render=renderAdminResults;   // live (default): realtime pushes redraw; the only input is the confirm sheet, which lives outside #adminBody
+
+/* ---- Scoring (§6, FR-53) — form over config.scoring + a live worked-example calculator that puts the
+   SAVED numbers beside the DRAFT ones, and "Recompute all points" (public.recompute_all_points()).
+   The server is the authority: audits_before_write() re-scores every write through score_detail() /
+   speed_bonus() straight from the config rows — this page only edits the numbers it reads.
+   Whole numbers where the schema casts ::int (all five point fields, speed start and floor); decay and
+   grace are ::numeric and may carry decimals. A decimal in an ::int field would make every member Save
+   fail, so the validator refuses it.
+   Locked while Live behind a deliberate unlock: config has no server-side Live gate (RLS only asks for
+   admin), so this page is the gate. live=false — realtime pushes must never redraw over the form. */
+const SC_POINT_FIELDS=["per_section","completion_bonus","per_photo","per_text","per_bullet"];
+const SC_SPEED_FIELDS=["start","decay_per_min","floor","grace_min"];
+const SC_SPEED_INTS=["start","floor"];
+const SC_DEFAULTS={per_section:10, completion_bonus:50, per_photo:15, per_text:10, per_bullet:5};
+const SC_SPEED_DEFAULTS={start:100, decay_per_min:2, floor:20, grace_min:5};
+const SC_LABELS={per_section:"Points per answered section", completion_bonus:"Completion bonus", per_photo:"Points per photo",
+  per_text:"Points per text answer", per_bullet:"Points per bullet", start:"Bonus start", decay_per_min:"Decay per minute",
+  floor:"Floor", grace_min:"Grace period"};
+const SC_MODES=[["per_door","Per door"],["per_team_visit","Per team visit"],["off","Off"]];
+const SC_MODE_DESC={
+  per_door:"The door’s timer starts at the first Start audit tap; the bonus locks when the member taps Done with every section answered.",
+  per_team_visit:"Legacy mode: one timer per team from Start visit, and every door locks against the legacy decay kept in config.scoring.speed.legacy.",
+  off:"No speed bonus at all — doors score on answers, photos and text only."
+};
+let ADMIN_SCORING_DRAFT=null, adminScoringSaving=false, adminScoringBusy=false, adminScoringUnlocked=false, adminScoringLast=null, adminScoringErr=null;
+const SC_EXAMPLE={minutes:"20", photos:"3", bullets:"3"};   // the BUSINESS-RULES §1 worked example → 300 with the seeded values
+
+function scCfg(){ return (CFG&&CFG.scoring)||{}; }
+function scParse(v){ const s=String(v==null?"":v).trim(); if(s==="") return null; const n=Number(s); return isFinite(n)? n : null; }
+function scFmt(n){ if(n==null||!isFinite(n)) return "—"; return String(Math.round(n*100)/100); }
+function scApplyPts(sc){   // same expression as applyConfig() — a save must leave PTS exactly where a reload would
+  sc=sc||{};
+  PTS = { section:+sc.per_section||10, completion:+sc.completion_bonus||50, photo:+sc.per_photo||15, quality:+sc.per_text||10, bullet:+sc.per_bullet||5,
+          speed:Object.assign({mode:"per_door", start:100, decay_per_min:2, floor:20, grace_min:5}, sc.speed||{}) };
+}
+function scWithDefaults(sc){   // a scoring object safe to do arithmetic with (the calculator never shows NaN)
+  const out=Object.assign({}, sc||{});
+  SC_POINT_FIELDS.forEach(k=>{ const n=scParse(out[k]); out[k]= n==null? SC_DEFAULTS[k] : n; });
+  const sp=Object.assign({mode:"per_door"}, SC_SPEED_DEFAULTS, (sc&&sc.speed)||{});
+  SC_SPEED_FIELDS.forEach(k=>{ const n=scParse(sp[k]); sp[k]= n==null? SC_SPEED_DEFAULTS[k] : n; });
+  out.speed=sp;
+  return out;
+}
+function scDraftFromCfg(){
+  const sc=scCfg(), sp=Object.assign({mode:"per_door"}, SC_SPEED_DEFAULTS, sc.speed||{}), d={};
+  SC_POINT_FIELDS.forEach(k=>{ d[k]= sc[k]==null? String(SC_DEFAULTS[k]) : String(sc[k]); });
+  d.mode= SC_MODES.some(m=>m[0]===sp.mode)? String(sp.mode) : "per_door";
+  SC_SPEED_FIELDS.forEach(k=>{ d[k]= sp[k]==null? String(SC_SPEED_DEFAULTS[k]) : String(sp[k]); });
+  return d;
+}
+function scDraft(){ if(!ADMIN_SCORING_DRAFT) ADMIN_SCORING_DRAFT=scDraftFromCfg(); return ADMIN_SCORING_DRAFT; }
+function scDirty(){
+  if(!ADMIN_SCORING_DRAFT) return false;
+  const a=ADMIN_SCORING_DRAFT, b=scDraftFromCfg();
+  return Object.keys(b).some(k=> String(a[k]).trim()!==String(b[k]).trim());
+}
+function scValidate(d){   // → {field: message}; every value a non-negative number, whole where the schema casts ::int, floor ≤ start
+  const e={}, val={};
+  const need=(k, intOnly)=>{
+    const n=scParse(d[k]);
+    if(n==null){ e[k]=SC_LABELS[k]+" must be a number"; return; }
+    if(n<0){ e[k]=SC_LABELS[k]+" can’t be negative"; return; }
+    if(intOnly && !Number.isInteger(n)){ e[k]=SC_LABELS[k]+" must be a whole number — the server stores it as an integer"; return; }
+    val[k]=n;
+  };
+  SC_POINT_FIELDS.forEach(k=>need(k, true));
+  SC_SPEED_FIELDS.forEach(k=>need(k, SC_SPEED_INTS.indexOf(k)>=0));
+  if(val.start!=null && val.floor!=null && val.floor>val.start) e.floor="Floor can’t be above the start value ("+val.start+")";
+  return e;
+}
+function scMergedScoring(d){   // value to persist: spread the saved object so lock_on, speed.legacy and anything else survive
+  const cur=scCfg(), sc=Object.assign({}, cur);
+  SC_POINT_FIELDS.forEach(k=>{ sc[k]=scParse(d[k]); });
+  const sp=Object.assign({}, cur.speed||{}, {mode:d.mode});
+  SC_SPEED_FIELDS.forEach(k=>{ sp[k]=scParse(d[k]); });
+  sc.speed=sp;
+  return sc;
+}
+function scBonusAt(sc, minutes){   // same branches as estimateBonus(), with an explicit scoring object and a chosen elapsed time
+  const sp=(sc&&sc.speed)||{};
+  if(sp.mode==="off") return 0;
+  const t0=nowMs(), end=t0+Math.max(0, minutes||0)*60000;
+  if(sp.mode==="per_team_visit") return bonusFor(t0, end, Object.assign({}, LEGACY_SPEED, sp.legacy||{}));
+  return bonusFor(t0, end, sp);
+}
+function scSpeedFormula(sc){
+  const sp=(sc&&sc.speed)||{};
+  if(sp.mode==="off") return "no speed bonus";
+  const s= sp.mode==="per_team_visit"? Object.assign({}, LEGACY_SPEED, sp.legacy||{}) : sp;
+  return "clamp("+scFmt(s.start)+" − "+scFmt(s.decay_per_min)+" × max(0, min − "+scFmt(s.grace_min)+"), "+scFmt(s.floor)+", "+scFmt(s.start)+")";
+}
+function scExNum(k, intOnly){   // the calculator's own inputs: blank or junk reads as 0, never NaN
+  const n=scParse(SC_EXAMPLE[k]);
+  if(n==null || n<0) return 0;
+  return intOnly? Math.floor(n) : n;
+}
+function scTextCount(){ return ((CFG.sections&&CFG.sections.text)||[]).length || 3; }
+function scTeamsPhrase(){ const n=Object.keys(GROUPS).length; return n===1? "the one active team" : "all "+n+" teams"; }   // never hard-code the team count (D-16/D-23)
+function scParts(sc, ex){   // the worked example of BUSINESS-RULES §1: every section answered, N photos, all text, M bullets
+  const p={};
+  p.sections=TOTAL_SECTIONS*sc.per_section;
+  p.completion=sc.completion_bonus;
+  p.photos=ex.photos*sc.per_photo;
+  p.text=scTextCount()*sc.per_text;
+  p.bullets=ex.bullets*sc.per_bullet;
+  p.speed=scBonusAt(sc, ex.minutes);
+  p.total=p.sections+p.completion+p.photos+p.text+p.bullets+p.speed;
+  return p;
+}
+function scCell(v, sub){
+  if(v==null) return '<span style="color:var(--faint)">—</span>';
+  return '<b class="num">'+esc(scFmt(v))+'</b>'+(sub? '<div style="color:var(--muted);font-size:11.5px;font-weight:600">'+esc(sub)+'</div>' : '');
+}
+function scCalcHtml(){
+  const ex={minutes:scExNum("minutes"), photos:scExNum("photos", true), bullets:scExNum("bullets", true)};
+  const saved=scWithDefaults(scCfg()), d=scDraft(), errs=scValidate(d);
+  const bad=Object.keys(errs).length>0, draft= bad? null : scWithDefaults(scMergedScoring(d));
+  const sp=scParts(saved, ex), dp= draft? scParts(draft, ex) : null;
+  const texts=scTextCount();
+  const row=(label, savedV, savedSub, draftV, draftSub)=>[esc(label), scCell(savedV, savedSub), scCell(dp? draftV : null, dp? draftSub : "")];
+  const rows=[
+    row("Sections answered", sp.sections, TOTAL_SECTIONS+" × "+scFmt(saved.per_section), dp&&dp.sections, dp? TOTAL_SECTIONS+" × "+scFmt(draft.per_section) : ""),
+    row("Completion bonus", sp.completion, "all "+TOTAL_SECTIONS+" answered", dp&&dp.completion, "all "+TOTAL_SECTIONS+" answered"),
+    row("Photos", sp.photos, ex.photos+" × "+scFmt(saved.per_photo), dp&&dp.photos, dp? ex.photos+" × "+scFmt(draft.per_photo) : ""),
+    row("Text answers", sp.text, texts+" × "+scFmt(saved.per_text), dp&&dp.text, dp? texts+" × "+scFmt(draft.per_text) : ""),
+    row("Bullets", sp.bullets, ex.bullets+" × "+scFmt(saved.per_bullet), dp&&dp.bullets, dp? ex.bullets+" × "+scFmt(draft.per_bullet) : ""),
+    row("Speed bonus", sp.speed, "at "+scFmt(ex.minutes)+" min", dp&&dp.speed, dp? "at "+scFmt(ex.minutes)+" min" : "")
+  ];
+  const delta= dp? dp.total-sp.total : 0;
+  const dcol= !dp? "var(--faint)" : delta>0? "var(--good)" : delta<0? "var(--bad)" : "var(--ink)";
+  rows.push(["<b>Audit total</b>",
+    '<b class="num" style="font-size:17px">'+esc(scFmt(sp.total))+'</b>',
+    dp? '<b class="num" style="font-size:17px;color:'+dcol+'">'+esc(scFmt(dp.total))+'</b>'+
+        (delta? '<div style="color:'+dcol+';font-size:11.5px;font-weight:700">'+(delta>0?"+":"")+esc(scFmt(delta))+'</div>' : '')
+      : scCell(null)]);
+  return resTable(["Part","Saved","Draft"], rows, ["left","right","right"], 340)+
+    (bad? '<div class="warnnote">Fix the highlighted fields to see what the draft would score.</div>' : '')+
+    '<div class="note"><b>Speed bonus</b> — '+esc(scSpeedFormula(dp? draft : saved))+'. This is an estimate for this page. '+
+      'The server recomputes every audit’s points on save and locks the real speed bonus from server time the moment a member taps Done.</div>';
+}
+function scRenderCalc(){ const host=document.getElementById("scCalc"); if(host) host.innerHTML=scCalcHtml(); }
+function scField(id, label, inputHtml, err, hint){
+  return '<div class="fld2"><label for="sc_'+id+'">'+label+'</label>'+inputHtml+
+    (err? '<div class="err" id="scerr_'+id+'">'+esc(err)+'</div>' : '')+(hint? '<div class="hint">'+hint+'</div>' : '')+'</div>';
+}
+function scInput(d, k, err, locked){
+  return '<input id="sc_'+k+'" type="text" inputmode="decimal" data-sc="'+k+'" value="'+esc(d[k])+'" autocomplete="off"'+
+    (err? ' aria-invalid="true"' : '')+(locked? ' disabled style="opacity:.55"' : '')+'>';
+}
+function scExInput(k, label){
+  return '<div class="fld2" style="margin:0;flex:1 1 92px;min-width:92px"><label for="scx_'+k+'">'+esc(label)+'</label>'+
+    '<input id="scx_'+k+'" type="text" inputmode="decimal" data-sx="'+k+'" value="'+esc(SC_EXAMPLE[k])+'" autocomplete="off"></div>';
+}
+function renderAdminScoring(el){
+  if(!adminConfigLocked()) adminScoringUnlocked=false;                      // leaving Live re-arms the lock
+  const live=adminConfigLocked(), locked= live && !adminScoringUnlocked;
+  const d=scDraft(), dirty=scDirty(), errs= dirty? scValidate(d) : {}, invalid=Object.keys(scValidate(d)).length>0, online=Store.online();
+  const num=(k, hint)=> scField(k, SC_LABELS[k], scInput(d, k, errs[k], locked), errs[k], hint);
+
+  let html='<div class="adm-toolbar"><div class="grow"><h3 style="font-size:19px">Scoring</h3>'+
+    '<div class="sub">config.scoring · the server re-scores every audit with these values the moment they are saved</div></div></div>';
+  if(!online) html+='<div class="note" style="margin:-4px 0 12px">Offline demo — edits apply to this device’s in-memory config only and nothing is persisted.</div>';
+
+  if(live){
+    html+='<div class="adm-card"><div class="eyebrow">Locked</div><h3 style="margin-top:4px">The event is Live</h3>'+
+      '<div class="sub" style="margin-top:6px">Scoring is frozen while audits count, so a number can’t move under a team mid-visit. Close or reopen the event on the '+
+        '<a href="#/admin/event">Event page</a> to edit it normally.</div>'+
+      (locked
+        ? '<div class="adm-toolbar" style="margin:12px 0 0"><button class="btn" data-act="scUnlock">Unlock editing…</button></div>'
+        : '<div class="warnnote">Unlocked. Anything you save here applies to '+scTeamsPhrase()+' immediately. Speed bonuses already locked at Done keep the value they locked with.</div>')+
+    '</div>';
+  }
+
+  html+='<form id="scForm" novalidate><div class="ev-grid"><div>'+
+    '<div class="adm-card"><h3>Points</h3><div class="sub" style="margin-bottom:12px">Whole numbers only — the database stores each of these as an integer.</div>'+
+      num("per_section", "Each of the "+TOTAL_SECTIONS+" audit sections a member answers.")+
+      num("completion_bonus", "Added once, only when all "+TOTAL_SECTIONS+" sections are answered.")+
+      num("per_photo", "Team photo and visibility photos alike.")+
+      num("per_text", "Each of the "+scTextCount()+" written answers (Keep / Stop / Opportunity).")+
+      num("per_bullet", "Each competition-activity and customer-insight bullet. No cap.")+
+    '</div>'+
+    '<div class="adm-card"><h3>Speed bonus</h3><div class="sub" style="margin-bottom:12px">'+esc(SC_MODE_DESC[d.mode]||"")+'</div>'+
+      scField("mode","Mode", '<div class="seg" role="group" id="sc_mode">'+SC_MODES.map(m=>
+        '<button type="button" data-sc="mode" data-val="'+esc(m[0])+'" aria-pressed="'+(d.mode===m[0])+'"'+(locked?' disabled':'')+'>'+esc(m[1])+'</button>').join("")+'</div>')+
+      num("start", "The bonus a door locks when it finishes inside the grace period.")+
+      num("decay_per_min", "Points lost per minute once the grace period is over. Decimals allowed.")+
+      num("floor", "However slow the door is, the bonus never drops below this.")+
+      num("grace_min", "Minutes before the decay starts. Decimals allowed.")+
+      '<div class="note" style="margin-top:0">A bonus is locked once, at the first Done with every section answered. Editing the door afterwards never re-opens it — only an admin timer reset on the Live Monitor does.</div>'+
+    '</div>'+
+  '</div><div>'+
+    '<div class="adm-card"><h3>Worked example</h3>'+
+      '<div class="sub" style="margin-bottom:10px">One door with every section answered, all '+scTextCount()+' text answers, and the photos, bullets and elapsed time you choose. Change any value in the form and this recomputes.</div>'+
+      '<div class="adm-toolbar" style="margin-bottom:10px">'+scExInput("minutes","Elapsed (min)")+scExInput("photos","Photos")+scExInput("bullets","Bullets")+'</div>'+
+      '<div id="scCalc">'+scCalcHtml()+'</div>'+
+    '</div>'+
+  '</div></div>'+
+  '<div class="ev-save"><div class="st'+(dirty&&!locked?' dirty':'')+'">'+
+      (locked? 'Locked while the event is Live' : dirty? '<span class="pd"></span>Unsaved changes' : 'All changes saved')+'</div>'+
+    (dirty && !locked? '<button type="button" class="btn" data-act="scDiscard">Discard</button>' : '')+
+    '<button type="submit" class="btn primary" id="scSave"'+((dirty && !invalid && !locked && !adminScoringSaving)? '' : ' disabled')+'>'+
+      (adminScoringSaving? "Saving…" : dirty? "Save scoring" : "Saved")+'</button></div></form>';
+
+  html+='<div class="adm-card"><h3>Recompute all points</h3>'+
+    '<div class="sub" style="margin-top:6px">Re-scores every saved audit from its stored answers with the scoring values that are saved now. '+
+      'Speed bonuses already locked at Done are left exactly as they are — changing these numbers is never retroactive for them. The server writes the recompute to the audit log.</div>'+
+    '<div class="warnnote" id="scRecomputeDirty"'+(dirty? '' : ' hidden')+'>Unsaved changes above — a recompute would use the values that are saved now, not the ones on screen. Save first.</div>'+
+    (adminScoringErr? '<div class="warnnote">'+esc(adminScoringErr)+'</div>' : '')+
+    (online? '' : '<div class="note">Admin actions need the online backend.</div>')+
+    '<div class="adm-toolbar" style="margin:12px 0 0"><button class="btn" data-act="scRecompute"'+((!online||dirty||adminScoringBusy)? ' disabled':'')+'>'+
+      (adminScoringBusy? "Recomputing…" : "Recompute all points")+'</button></div>'+
+    (adminScoringLast? '<div class="note">'+(adminScoringLast.n==null? "Recomputed" : "Recomputed "+adminScoringLast.n+" audit"+(adminScoringLast.n===1?"":"s"))+' · '+esc(relTime(adminScoringLast.ts))+'</div>' : '')+
+  '</div>';
+
+  el.innerHTML=html;
+  const form=el.querySelector("#scForm");
+  form.addEventListener("input", scOnInput);
+  form.addEventListener("change", scOnInput);
+  form.addEventListener("click", ev=>{
+    const b=ev.target.closest('.seg button[data-sc="mode"]'); if(!b || b.disabled) return;
+    ev.preventDefault(); scDraft().mode=b.dataset.val; renderAdminPage();
+  });
+  form.addEventListener("submit", ev=>{ ev.preventDefault(); saveScoring(); });
+}
+function scOnInput(ev){
+  const t=ev.target; if(!t || !t.dataset) return;
+  if(t.dataset.sc && t.dataset.sc!=="mode"){ scDraft()[t.dataset.sc]=t.value; scRefreshLive(); return; }
+  if(t.dataset.sx){ SC_EXAMPLE[t.dataset.sx]=t.value; scRenderCalc(); }
+}
+function scRefreshLive(){   // cheap partial update while typing: save bar, recompute button, field errors, calculator — never a full redraw (keeps focus)
+  const dirty=scDirty(), errs=scValidate(scDraft()), invalid=Object.keys(errs).length>0, locked= adminConfigLocked() && !adminScoringUnlocked;
+  const st=document.querySelector("#adminBody .ev-save .st"), btn=document.getElementById("scSave"), bar=document.querySelector("#adminBody .ev-save");
+  if(st && !locked){ st.className="st"+(dirty?" dirty":""); st.innerHTML= dirty? '<span class="pd"></span>Unsaved changes' : 'All changes saved'; }
+  if(btn){ btn.disabled= !dirty || invalid || locked || adminScoringSaving; btn.textContent= adminScoringSaving? "Saving…" : dirty? "Save scoring" : "Saved"; }
+  if(bar && dirty && !locked && !bar.querySelector('[data-act="scDiscard"]')){
+    const b=document.createElement("button"); b.type="button"; b.className="btn"; b.dataset.act="scDiscard"; b.textContent="Discard"; bar.insertBefore(b, btn);
+  }
+  if(bar && (!dirty || locked)){ const b=bar.querySelector('[data-act="scDiscard"]'); if(b) b.remove(); }
+  const warn=document.getElementById("scRecomputeDirty"); if(warn) warn.hidden=!dirty;
+  const rb=document.querySelector('#adminBody [data-act="scRecompute"]'); if(rb) rb.disabled= !Store.online() || dirty || adminScoringBusy;
+  // every field, not just the edited one: floor ≤ start puts its message on `floor` while `start` is what changed
+  SC_POINT_FIELDS.concat(SC_SPEED_FIELDS).forEach(f=>{
+    const inp=document.getElementById("sc_"+f), old=document.getElementById("scerr_"+f);
+    if(!inp) return;
+    inp.setAttribute("aria-invalid", errs[f]? "true":"false");
+    if(old && old.textContent===errs[f]) return;                     // already right — leave the node alone
+    if(old) old.remove();
+    if(errs[f]){ const div=document.createElement("div"); div.className="err"; div.id="scerr_"+f; div.textContent=errs[f]; inp.insertAdjacentElement("afterend", div); }
+  });
+  scRenderCalc();
+}
+async function writeScoringConfig(nextScoring){   // same put() shape as writeEventConfig(): .select("key") so an RLS-filtered zero-row write surfaces
+  if(Store.online()){
+    if(!Store.table("config")){ toast("Admin actions need the online backend"); return false; }
+    const r=await Store.table("config")
+      .update({value:nextScoring, updated_at:new Date().toISOString(), updated_by:(ME&&ME.name)||"admin"})
+      .eq("key","scoring").select("key");
+    if(r.error) throw r.error;
+    if(!r.data || r.data.length!==1) throw new Error("Not saved — no permission or the 'scoring' row is missing");
+  }
+  CFG=Object.assign({}, CFG, {scoring:nextScoring});   // optimistic; the realtime config push re-applies the identical server value
+  scApplyPts(nextScoring);
+  renderHints();
+  if(ME) refreshAll();
+  toast(Store.online()? "Scoring saved" : "Applied on this device only — not persisted (offline demo)");
+  return true;
+}
+async function saveScoring(){
+  if(adminScoringSaving || !scDirty()) return;
+  if(adminConfigLocked() && !adminScoringUnlocked){ toast("Scoring is locked while the event is Live — unlock it first"); return; }
+  const d=scDraft(), errs=scValidate(d);
+  if(Object.keys(errs).length){
+    renderAdminPage();
+    const first=document.querySelector('#scForm [aria-invalid="true"]'); if(first) first.focus();
+    toast(errs[Object.keys(errs)[0]]); return;
+  }
+  adminScoringSaving=true; scRefreshLive();
+  try{
+    const ok=await writeScoringConfig(scMergedScoring(d));
+    if(ok) ADMIN_SCORING_DRAFT=null;
+  }catch(e){ console.error(e && e.message); toast(friendlyErr(e, "Couldn’t save — try again")); }
+  finally{ adminScoringSaving=false; if(adminActive() && adminPage==="scoring") renderAdminPage(); }
+}
+ADMIN_ACTIONS.scDiscard=function(){ ADMIN_SCORING_DRAFT=null; renderAdminPage(); toast("Changes discarded"); };
+ADMIN_ACTIONS.scUnlock=async function(){
+  const ok=await adminConfirm({title:"Edit scoring while the event is Live?", danger:true, okLabel:"Unlock editing",
+    body:"Every audit saved from now on is scored with the new numbers, for "+scTeamsPhrase()+" at once. Speed bonuses already locked at Done keep the value they locked with — nothing you change here is applied to them retroactively. Audits already saved keep their stored points until you run Recompute all points."});
+  if(!ok) return;
+  adminScoringUnlocked=true; renderAdminPage(); toast("Scoring unlocked — edits apply to the live event");
+};
+ADMIN_ACTIONS.scRecompute=async function(){
+  if(adminScoringBusy) return;
+  if(adminOffline()) return;
+  if(scDirty()){ toast("Save the scoring changes first — a recompute uses the saved values"); return; }
+  const ok=await adminConfirm({title:"Recompute all points?", okLabel:"Recompute",
+    body:"Every saved audit is re-scored from its stored answers with the scoring values saved now. Speed bonuses locked at Done are not recalculated. The server logs who ran it."});
+  if(!ok) return;
+  adminScoringBusy=true; adminScoringErr=null; renderAdminPage();
+  try{
+    const n=await Store.rpc("recompute_all_points");
+    adminScoringLast={n:(typeof n==="number"? n : null), ts:Date.now()}; adminScoringErr=null;
+    toast(typeof n==="number"? ("Recomputed "+n+" audit"+(n===1?"":"s")) : "Recompute finished");
+  }catch(e){
+    console.error(e && e.message);
+    const m=(e&&e.message)||"";
+    // 21000 from pg-safeupdate: recompute_all_points() runs "update audits set doc = doc" with no WHERE,
+    // which Supabase blocks. Nothing was written. The fix belongs in the SQL function, not here.
+    adminScoringErr= /where clause/i.test(m)
+      ? "Recompute failed and nothing was changed — the server’s recompute_all_points() updates every audit without a WHERE clause, which the database refuses. It needs a one-line fix in the schema before this button can work."
+      : "Recompute failed and nothing was changed — "+m.slice(0,120);
+    toast(friendlyErr(e, "Recompute failed"));
+  }
+  finally{ adminScoringBusy=false; if(adminActive() && adminPage==="scoring") renderAdminPage(); }
+};
+ADMIN_PAGES.scoring.render=renderAdminScoring;
+ADMIN_PAGES.scoring.live=false;   // the form and the calculator must survive realtime config/audit pushes
+
 /* ---------------- TOAST ---------------- */
 let toastT=null;
 function toast(msg, action){   // action = {label, onClick} keeps the toast up until tapped (FR-65)
@@ -2964,20 +3694,59 @@ async function buildTeamPdf(team){
   }
   return doc;
 }
-async function generateReport(){
+async function generateReport(btn){
   if(!(window.jspdf && window.jspdf.jsPDF)){ toast("PDF tool still loading — try again"); return; }
   const team=viewTeam||ME.team;
-  const btn=document.getElementById("btnReport"), old=btn.textContent; btn.disabled=true; btn.textContent="Building…";
+  btn=btn||document.getElementById("btnReport");
+  const old=btn? btn.textContent : "";
+  if(btn){ btn.disabled=true; btn.textContent="Building…"; }
   try{
     const doc=await buildTeamPdf(team);
     const fname=teamPdfName(team);
     const res=await sharePDF(doc, fname);
     toast(res==="shared"?"Shared ✓":res==="cancel"?"Cancelled":res==="fail"?"Couldn't export PDF":"PDF report ready ✓");
   }catch(err){ console.error(err); toast("Report failed — try again"); }
-  finally{ btn.disabled=false; btn.textContent=old; }
+  finally{ if(btn){ btn.disabled=false; btn.textContent=old; } }
 }
 function teamPdfName(team){ return ("Field Cup - "+teamDisplayName(team)+" report.pdf").replace(/[^\w.\- ]/g,""); }
-document.getElementById("btnReport").addEventListener("click", generateReport);
+document.getElementById("btnReport").addEventListener("click", ()=>generateReport());
+
+/* ---- Finish-visit card (FR-71) — every door on the route Completed ---- */
+function finishStats(team){
+  const list=DOORS.filter(d=>d.team===team);
+  if(!list.length) return null;
+  for(const d of list){ const a=AUDITS[auditId(team,d.id)]; if(!a || a.complete!==true) return null; }   // not finished yet
+  const start=TEAMS[team]&&TEAMS[team].startTs, end=teamFinishTs(team);
+  return { doors:list.length, points:teamPoints(team), start, end:isFinite(end)? end : null };
+}
+function renderFinishCard(){
+  const team = (ME && ME.role==="member" && ME.team) ? ME.team : viewTeam;
+  const st = (ME && team) ? finishStats(team) : null;
+  ["finishCard","finishCardBoard"].forEach(id=>{
+    const el=document.getElementById(id); if(!el) return;
+    if(!st){ el.hidden=true; el.innerHTML=""; return; }
+    const elapsed = (st.start && st.end && st.end>st.start) ? fmtElapsed(st.end-st.start) : null;
+    el.hidden=false;
+    el.innerHTML='<div class="cl"><div class="ctitle">🐝 All '+st.doors+' doors done</div>'+
+      '<div class="clk num">'+st.points.toLocaleString()+'<small style="font-size:13px; color:var(--muted); font-family:var(--fs-ui); font-weight:600"> pts</small></div>'+
+      '<div class="csub">'+esc(teamDisplayName(team))+(elapsed? " · finished in "+elapsed : "")+'</div></div>'+
+      '<div style="display:flex; flex-direction:column; gap:6px; flex:0 0 auto">'+
+        '<button class="cstart js-finish-pdf" type="button">⬇︎ PDF</button>'+
+        '<button class="btn js-finish-share" type="button" style="padding:9px 14px; font-size:13px">Share</button></div>';
+  });
+}
+document.addEventListener("click", ev=>{
+  const pdf=ev.target.closest && ev.target.closest(".js-finish-pdf");
+  if(pdf){ generateReport(pdf); return; }
+  const sh=ev.target.closest && ev.target.closest(".js-finish-share");
+  if(!sh) return;
+  const team=(ME && ME.role==="member" && ME.team) ? ME.team : viewTeam, st=finishStats(team);
+  if(!st) return;
+  const el=(st.start && st.end && st.end>st.start)? fmtElapsed(st.end-st.start) : null;
+  const text=teamDisplayName(team)+" finished all "+st.doors+" doors — "+st.points+" points"+(el? " in "+el : "")+". "+((CFG.event&&CFG.event.name)||"Field Cup")+" 🐝";
+  if(navigator.share){ navigator.share({text}).catch(()=>{}); return; }
+  try{ navigator.clipboard.writeText(text).then(()=>toast("Copied ✓ — paste into WhatsApp"), ()=>toast(text)); }catch(e){ toast(text); }
+});
 
 /* ---------------- BOOT ---------------- */
 let subsStarted=false;
@@ -3000,6 +3769,7 @@ function enterApp(){
   startClockTicker();
   routeFromHash();
   applyConnectivity();   // app started without signal (or Store.me() fell back to the cached identity) → read-only Offline state from the first paint
+  maybeOfferInstall();   // FR-64 — one-time, and only when there is something actionable to offer
 }
 async function boot(){
   await Store.init();
@@ -3020,6 +3790,35 @@ boot();
 
 /* ---------------- PWA: service worker + update toast (FR-61/65) ---------------- */
 let swReloadRequested=false, swRefreshing=false;
+/* ---- Install prompt (FR-64) — one-time, post-login, never once installed ----
+   Android fires beforeinstallprompt (often before anyone has logged in), so the event is captured here and
+   used later; iOS never fires it at all and needs the Share-sheet instruction instead. */
+let deferredInstall=null;
+window.addEventListener("beforeinstallprompt", e=>{ e.preventDefault(); deferredInstall=e; });
+window.addEventListener("appinstalled", ()=>{ deferredInstall=null; try{ localStorage.setItem(INSTALL_FLAG,"1"); }catch(e){} });
+const INSTALL_FLAG="fc:install-offered";
+function isInstalled(){
+  try{ return window.matchMedia("(display-mode: standalone)").matches || navigator.standalone===true; }catch(e){ return false; }
+}
+function maybeOfferInstall(){
+  if((CFG.features||{}).pwa_install_prompt===false) return;      // config can switch it off entirely
+  if(isInstalled()) return;                                       // already on the Home Screen — nothing to offer
+  try{ if(localStorage.getItem(INSTALL_FLAG)==="1") return; }catch(e){}   // one time only, ever
+  const ios=/iPad|iPhone|iPod/.test(navigator.userAgent||"") && !window.MSStream;
+  if(!deferredInstall && !ios) return;                            // no native prompt and not iOS → nothing useful to say
+  setTimeout(()=>{                                                // after the first paint, so it never competes with login
+    try{ localStorage.setItem(INSTALL_FLAG,"1"); }catch(e){}
+    if(deferredInstall){
+      toast("Add Field Cup to your Home Screen for a full-screen app", {label:"Add", onClick:async()=>{
+        const e=deferredInstall; deferredInstall=null;
+        try{ e.prompt(); await e.userChoice; }catch(err){}
+      }});
+    } else {
+      toast("To install: tap Share, then Add to Home Screen", {label:"Got it", onClick:()=>{}});
+    }
+  }, 1500);
+}
+
 function swOfferReload(worker){
   toast("Update available — Reload", {label:"Reload", onClick:()=>{ swReloadRequested=true; try{ worker.postMessage({type:"SKIP_WAITING"}); }catch(e){} }});
 }
