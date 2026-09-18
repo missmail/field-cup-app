@@ -533,6 +533,15 @@
   .ev-save .st.dirty{color:var(--warn)}
   .ev-save .st .pd{display:inline-block; width:8px; height:8px; border-radius:50%; background:currentColor; margin-right:6px; vertical-align:1px}
   .ev-save .btn{flex:0 0 auto; width:auto; padding:11px 16px}
+  /* Print — the PIN hand-over sheet (D-44), so a set of PINs can go out on paper in a room with no signal
+     without any of them being written to a file. Everything else drops out; `visibility` rather than
+     `display` keeps the sheet's own layout intact. */
+  @media print{
+    body *{visibility:hidden; box-shadow:none!important}
+    #adminSheet, #adminSheet *{visibility:visible}
+    #adminSheet{position:absolute; inset:0 auto auto 0; width:100%; max-height:none; height:auto; transform:none; border:0}
+    #adminSheet .btnrow, .scrim{display:none!important}
+  }
   @media (prefers-reduced-motion:reduce){*{animation:none!important; transition:none!important}}
   @media (max-width:380px){ .opt{min-width:100%} }
 </style>
@@ -634,6 +643,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
         <span id="dsAuditLabel">Start audit</span></button>
     </div>
+    <div id="dsClaim" hidden></div>
     <div class="detrow"><span class="lbl">Status</span><span class="val" id="dsStatus">—</span></div>
     <div class="detrow"><span class="lbl">Points earned</span><span class="val num" id="dsPoints">0</span></div>
     <div class="detrow"><span class="lbl">Audited by</span><span class="val" id="dsBy">—</span></div>
@@ -1104,6 +1114,28 @@ function computePoints(a){
   if(answered===TOTAL_SECTIONS) p += PTS.completion;
   return p;
 }
+/* ---------------- DOOR CLAIMS (D-45) ----------------
+   The `audits_before_claim` trigger is the authority; it refuses the write with SQLSTATE 55006 whichever
+   way this renders. All of this exists so a member sees "Hassan is in this door" BEFORE filling a form in,
+   rather than losing the work to an error on Save. A claim is held by a PERSON, not a device, so the same
+   person on a second phone is never blocked by themselves. */
+function claimsOn(){ return !!(CFG.event && CFG.event.door_claims===true); }
+function claimTtlMs(){ const m=+((CFG.event||{}).claim_ttl_min); return (m>0? m : 30)*60000; }
+function claimOn(a){   // → {personId, name, since, mine} or null
+  if(!a || !claimsOn()) return null;
+  const id=a.claimedById; if(!id) return null;
+  if(a.lockedAt) return null;                                   // Done releases the door for the whole team
+  const since=Date.parse(a.claimedAt||"")||0, last=Math.max(since, Date.parse(a.updatedAt||"")||0);
+  if(last && nowMs()-last > claimTtlMs()) return null;          // gone stale — anyone may take it over
+  return {personId:id, name:a.claimedBy||"A team-mate", since:since||last, mine: !!(ME && ME.personId===id)};
+}
+/* Somebody ELSE is in this door. The only case that blocks; supervisors and admins are never claim-blocked. */
+function claimBlocks(a){
+  if(!ME || ME.role!=="member") return null;
+  const c=claimOn(a); return (c && !c.mine)? c : null;
+}
+function iAmTeamLead(){ const p=(ROSTER||[]).find(r=>ME && r.id===ME.personId); return !!(p && p.is_lead); }
+
 function doorStatus(doorId, team){
   const a = AUDITS[auditId(team,doorId)];
   if(!a) return {s:"todo", label:"Not started", answered:0};
@@ -1228,10 +1260,12 @@ function renderDoors(){
     const st=doorStatus(d.id,viewTeam);
     const a=AUDITS[auditId(viewTeam,d.id)];
     const p=a?(a.points||computePoints(a)):0;
+    const held=claimOn(a);   // D-45: who is in this door right now — shown to everyone, blocks only a team-mate
     const pillCls=st.s, pillTxt=st.label;
     return '<button class="door" data-door="'+d.id+'" style="--stripe:'+g.color+'">'+
       '<div class="body"><div class="name">'+esc(d.name)+'</div>'+
-      '<div class="meta"><span>'+esc(g.name)+'</span>'+(st.s==="part"?'<span>· '+st.answered+'/'+TOTAL_SECTIONS+' sections</span>':'')+'</div></div>'+
+      '<div class="meta"><span>'+esc(g.name)+'</span>'+(st.s==="part"?'<span>· '+st.answered+'/'+TOTAL_SECTIONS+' sections</span>':'')+
+        (held? '<span style="color:var(--'+(held.mine?'good':'warn')+'); font-weight:700">· '+(held.mine? 'you are in this door' : esc(held.name)+' is in this door')+'</span>' : '')+'</div></div>'+
       '<div class="right"><span class="pill '+pillCls+'"><span class="pd"></span>'+pillTxt+'</span>'+
       '<span class="pts num">'+p+'<small>pts</small></span></div></button>';
   }).join("");
@@ -1486,7 +1520,29 @@ async function openDoor(doorId, team){
   document.getElementById("dsSections").innerHTML = sectionsHTML(a);
   document.getElementById("dsAuditLabel").textContent = st.s==="todo" ? "Start audit" : st.s==="done" ? "Edit audit" : "Continue audit";
   const canEdit = canEditTeam(team);
-  document.getElementById("dsAudit").style.display = canEdit ? "" : "none";
+  const auditBtn=document.getElementById("dsAudit");
+  auditBtn.style.display = canEdit ? "" : "none";
+  /* D-45 — say who has the door and what to do about it, instead of letting them fill a form in and lose
+     it to an error on Save. The button is disabled here; the trigger refuses the write regardless. */
+  const blocked=claimBlocks(a), claimEl=document.getElementById("dsClaim");
+  auditBtn.disabled=!!blocked;
+  if(blocked) document.getElementById("dsAuditLabel").textContent="In use";
+  claimEl.hidden=!blocked;
+  claimEl.innerHTML = blocked
+    ? '<div class="warnnote" style="margin:0 0 10px"><b>'+esc(blocked.name)+'</b> is auditing this door right now, so it is locked to them'+
+      (blocked.since? ' (since '+esc(fmtElapsed(nowMs()-blocked.since))+' ago)' : '')+
+      '. Take another door — it unlocks by itself when they tap Done or stop working on it.'+
+      (iAmTeamLead()? '<div class="btnrow" style="margin:8px 0 0"><button class="btn" id="dsRelease">Release it (team lead)</button></div>' : '')+'</div>'
+    : "";
+  const rel=document.getElementById("dsRelease");
+  if(rel) rel.addEventListener("click", async ()=>{
+    const ok=await adminConfirm({title:"Release "+d.name+" from "+blocked.name+"?", okLabel:"Release",
+      body:"Do this only if they are not actually in the shop — anything they have not saved is theirs to lose."});
+    if(!ok) return;
+    try{ const r=await Store.rpc("release_door_claim", {audit_id:auditId(team,doorId), reason:"released in the app"});
+      toast((r&&r.was)? "Released — "+r.was+" is no longer in "+d.name : d.name+" released"); refreshAll(); closeAll(); }
+    catch(e){ toast(((e&&e.message)||"Couldn’t release that door").slice(0,110)); }
+  });
   openSheet("doorSheet");
   // photos
   const th=document.getElementById("dsThumbs"); th.innerHTML='<span class="none">Loading…</span>';
@@ -1754,7 +1810,10 @@ async function saveAuditForm(done){
     if(done && navigator.vibrate){ try{ navigator.vibrate(30); }catch(e){} }
   }catch(err){
     const msg=(err && err.message)||"";
-    toast(/Done requires/.test(msg) ? msg : /row-level security|permission|policy/i.test(msg) ? "Not allowed for your role or team" : "Save failed — try again");
+    /* D-45: a claim conflict (55006) arrives with the holder's name in it, which is the one thing the member
+       needs. The form stays open either way, so everything typed is still on screen. */
+    const claimed = (err && err.code==="55006") || /auditing this door right now/i.test(msg);
+    toast(claimed ? msg : /Done requires/.test(msg) ? msg : /row-level security|permission|policy/i.test(msg) ? "Not allowed for your role or team" : "Save failed — try again");
   }finally{ btnS.disabled=false; btnD.disabled=false; btnS.textContent="Save"; updateScore(); applyConnectivity(); }
 }
 document.getElementById("afSave").addEventListener("click", ()=>saveAuditForm(false));
@@ -1909,7 +1968,8 @@ function routeFromHash(){
   const tabbar=document.querySelector(".tabbar"), adminView=document.getElementById("view-admin"), app=document.getElementById("app");
   if(parts[0]==="admin"){
     if(ME.role!=="admin"){ toast("Admin only"); location.hash="#/"; return; }
-    adminPage = ADMIN_PAGES[parts[1]] ? parts[1] : ADMIN_DEFAULT;
+    loadAdminCaps();
+    adminPage = (ADMIN_PAGES[parts[1]] && adminCanSee(parts[1])) ? parts[1] : ADMIN_DEFAULT;
     if(parts[1]!==adminPage){ try{ history.replaceState(null, "", "#/admin/"+adminPage); }catch(e){} }   // normalise #/admin and unknown pages
     document.querySelectorAll(".view").forEach(v=> v.classList.toggle("active", v.id==="view-admin"));
     tabbar.hidden=true; app.classList.add("admin"); document.body.classList.add("admin"); hideMapPop();
@@ -1926,7 +1986,22 @@ window.addEventListener("hashchange", routeFromHash);
    Set ADMIN_PAGES.<key>.live = false on form pages that must not be redrawn by realtime pushes.
    Row/button actions: give the element data-act="<name>" and register ADMIN_ACTIONS.<name> = function(el, ev){}. */
 const ADMIN_ORDER=["dashboard","event","teams","roster","form","scoring","people","monitor","data","results","system"];
-const ADMIN_DEFAULT="people";
+const ADMIN_DEFAULT="dashboard";   // the console opens on what is happening now, not on set-up work
+/* D-42 — admin levels. A database WITHOUT 005_admin_roles_teams.sql has no levels at all, and then every
+   admin is an owner, which is exactly how this panel behaved before: that is the safe default on any error,
+   because the alternative locks the only admin out of System on event morning. Probed once per session.
+   Hiding a section is NEVER the guard — every owner-only RPC checks is_owner() in the database. */
+const ADMIN_OWNER_ONLY={system:1, scoring:1};
+let ADMIN_CAPS={hasLevels:false, isOwner:true}, adminCapsLoaded=false;
+async function loadAdminCaps(){
+  if(adminCapsLoaded || !Store.online()) return;
+  adminCapsLoaded=true;
+  try{ const v=await Store.rpc("is_owner"); ADMIN_CAPS={hasLevels:true, isOwner:v===true}; }
+  catch(e){ ADMIN_CAPS={hasLevels:false, isOwner:true}; }   // 42883 = this database has no 005
+  if(adminActive()) renderAdmin();
+}
+function adminCanSee(key){ return !(ADMIN_OWNER_ONLY[key] && ADMIN_CAPS.hasLevels && !ADMIN_CAPS.isOwner); }
+function adminIsOwner(){ return !ADMIN_CAPS.hasLevels || ADMIN_CAPS.isOwner; }
 const ADMIN_PAGES={
   dashboard:{title:"Dashboard",     render:renderAdminDashboard},
   event:    {title:"Event",         render:adminPlaceholder("Event settings", 2, "Ships Day 3 (Must, FR-49)")},
@@ -1962,9 +2037,9 @@ function renderAdminHead(){   // title + status pill; also called on realtime co
     '<a class="back" href="#/">← Member app</a>';
 }
 function renderAdmin(){
-  if(!ADMIN_PAGES[adminPage]) adminPage=ADMIN_DEFAULT;
+  if(!ADMIN_PAGES[adminPage] || !adminCanSee(adminPage)) adminPage=ADMIN_DEFAULT;
   renderAdminHead();
-  document.getElementById("adminNav").innerHTML=ADMIN_ORDER.filter(k=>ADMIN_PAGES[k]).map(k=>
+  document.getElementById("adminNav").innerHTML=ADMIN_ORDER.filter(k=>ADMIN_PAGES[k] && adminCanSee(k)).map(k=>
     '<a href="#/admin/'+k+'"'+(k===adminPage?' aria-current="page"':'')+'>'+esc(ADMIN_PAGES[k].title)+'</a>').join("");
   const cur=document.querySelector('#adminNav a[aria-current="page"]');
   if(cur && cur.scrollIntoView){ try{ cur.scrollIntoView({block:"nearest", inline:"center"}); }catch(e){} }
@@ -2109,13 +2184,127 @@ function peopleGroups(){
 }
 function personRow(p){
   const issued= p.pin_status==="active" || p.pin_status==="expired";
+  /* "Not sent" is D-44's delivery marker: a PIN cannot be shown twice, so one that was issued and never
+     handed over is a person who will not be able to log in on event morning, and nothing else says so. */
+  /* Only once 005 is applied: before it admin_list_people has no delivered_at column at all, and this
+     would put "Not sent" on every active PIN in the roster. Key presence, not value. */
+  const notSent = p.pin_status==="active" && ("delivered_at" in p) && !p.delivered_at;
   return '<div class="prow'+(p.active===false?' inactive':'')+'">'+
-    '<div class="who"><b>'+esc(p.name)+(p.is_lead?'<span class="pill info">Lead</span>':'')+(p.active===false?'<span class="pill todo">Archived</span>':'')+'</b>'+
-      '<div class="m">'+pinPill(p.pin_status)+'<span>'+esc(roleLabel(p.role))+(p.role==="member"? ' · '+esc(teamShort(p.team_id)) : '')+'</span>'+
-      (issued? '<span>· '+(p.devices||0)+' device'+(p.devices===1?'':'s')+'</span><span>· seen '+esc(relTime(p.last_seen))+'</span><span>· expires '+esc(fmtShortDate(p.expires_at))+'</span>' : '')+
+    '<div class="who"><b>'+esc(p.name)+(p.is_lead?'<span class="pill info">Lead</span>':'')+
+      (p.role==="admin" && ADMIN_CAPS.hasLevels && p.admin_level==="owner"? '<span class="pill done">Owner</span>':'')+
+      (p.active===false?'<span class="pill bad">Disabled</span>':'')+'</b>'+
+      '<div class="m">'+pinPill(p.pin_status)+(notSent? '<span class="pill part"><span class="pd"></span>Not sent</span>' : '')+
+      '<span>'+esc(roleLabel(p.role))+(p.role==="member"? ' · '+esc(teamShort(p.team_id)) : '')+'</span>'+
+      (issued? '<span>· '+(p.devices||0)+' device'+(p.devices===1?'':'s')+'</span><span>· seen '+esc(relTime(p.last_seen))+'</span>' : '')+
     '</div></div>'+
     '<div class="acts"><button class="btn" data-act="issue" data-pid="'+esc(p.person_id)+'" data-rotate="'+(issued?1:0)+'">'+(issued?"Rotate":"Issue PIN")+'</button>'+
-      (issued? '<button class="btn danger" data-act="revoke" data-pid="'+esc(p.person_id)+'">Revoke</button>' : '')+'</div></div>';
+      '<button class="btn" data-act="manage" data-pid="'+esc(p.person_id)+'">Manage</button></div></div>';
+}
+
+/* ================= MANAGE ONE PERSON (D-42/D-43/D-46) =================
+   Everything that can be done to somebody, in one sheet: rename, change role, MOVE TEAM, make them the
+   team lead, set an admin's level, revoke their PIN, disable them, delete them. Five buttons per row is how
+   the wrong person gets revoked on event morning; this is one button per row and one place to be careful.
+   Every guard here is repeated in the database — the UI only makes the consequence readable first. */
+function openManagePerson(p){
+  const teams=Object.keys(GROUPS);
+  const self=isSelf(p), issued=p.pin_status==="active"||p.pin_status==="expired";
+  const levels=ADMIN_CAPS.hasLevels && p.role==="admin";
+  const roleLocked = self || (ADMIN_CAPS.hasLevels && !ADMIN_CAPS.isOwner && p.role==="admin");
+  let role=p.role, team=p.team_id;
+  adminSheet({title:p.name, sub:roleLabel(p.role)+(p.is_lead? " · team lead":"")+(p.active===false? " · disabled":""), html:
+    '<div class="fld2"><label for="mpName">Name</label><input id="mpName" type="text" autocomplete="off" maxlength="60" value="'+esc(p.name)+'"></div>'+
+    '<div class="fld2"><label>Role</label><div class="seg" id="mpRole">'+["member","supervisor","admin"].map(r=>'<button type="button" data-role="'+r+'" aria-pressed="'+(r===role)+'"'+(roleLocked&&r!==role?" disabled":"")+'>'+roleLabel(r)+'</button>').join("")+'</div>'+
+      (self? '<div class="sub" style="margin-top:4px">You cannot change your own role — ask another owner.</div>'
+           : (roleLocked? '<div class="sub" style="margin-top:4px">Only an owner can add or remove an admin.</div>' : ''))+'</div>'+
+    '<div class="fld2" id="mpTeamWrap"'+(role!=="member"?" hidden":"")+'><label>Team</label><div class="seg" id="mpTeam">'+
+      teams.map(t=>'<button type="button" data-team="'+t+'" aria-pressed="'+(+t===team)+'"><span class="dot" style="background:'+esc(GROUPS[t].color)+'"></span>'+esc(GROUPS[t].short)+'</button>').join("")+'</div>'+
+      '<div class="sub" style="margin-top:4px">Moving somebody changes the doors they see. Audits they already scored stay with the team that did the work.</div></div>'+
+    '<div class="pinerr" id="mpErr" hidden></div>'+
+    '<div class="btnrow"><button class="btn" id="mpCancel">Close</button><button class="btn primary" id="mpSave">Save changes</button></div>'+
+    (p.role==="member" && p.team_id!=null?
+      '<div class="adm-card" style="margin-top:12px"><b style="font-size:14px">Team lead</b>'+
+      '<div class="sub" style="margin-top:4px">The lead normally taps <b>Start visit</b> and is the only member who can release a door another member is holding. One lead per team.</div>'+
+      '<div class="btnrow" style="margin-bottom:0"><button class="btn" id="mpLead"'+(p.active===false&&!p.is_lead?" disabled":"")+'>'+(p.is_lead? "Remove as team lead" : "Make team lead")+'</button></div></div>' : "")+
+    (levels?
+      '<div class="adm-card" style="margin-top:12px"><b style="font-size:14px">Console permissions</b>'+
+      '<div class="sub" style="margin-top:4px"><b>Owner</b> — everything, including System, Scoring, wiping data and managing admins.<br><b>Admin</b> — Dashboard, Event, People, Teams, Monitor, Results and exports. No System, no Scoring, no wipe.</div>'+
+      '<div class="seg" id="mpLevel" style="margin-top:8px">'+["owner","admin"].map(l=>'<button type="button" data-level="'+l+'" aria-pressed="'+((p.admin_level||"admin")===l)+'"'+((self||!ADMIN_CAPS.isOwner)?" disabled":"")+'>'+(l==="owner"?"Owner":"Admin")+'</button>').join("")+'</div>'+
+      (self? '<div class="sub" style="margin-top:6px">You cannot change your own level — that is how a console ends up with nobody who can fix it.</div>'
+           : (!ADMIN_CAPS.isOwner? '<div class="sub" style="margin-top:6px">Only an owner can change this.</div>' : ''))+'</div>' : "")+
+    '<div class="adm-card" style="margin-top:12px"><b style="font-size:14px">Personal PIN</b>'+
+      '<div class="sub" style="margin-top:4px">'+
+        (p.pin_status==="active"
+          ? (p.delivered_at? "Active and sent "+esc(fmtShortDate(p.delivered_at))+(p.delivered_by? " by "+esc(p.delivered_by) : "")+"."
+             : ("delivered_at" in p? "Active, and <b>never marked as sent</b>." : "Active."))+
+            " A PIN cannot be shown twice — rotate it to get a new one you can send."
+          : p.pin_status==="expired"? "Expired. Issue a new one to let them back in."
+          : "Not issued yet. They cannot sign in until you issue one.")+'</div>'+
+      '<div class="btnrow" style="margin-bottom:0"><button class="btn" id="mpIssue"'+(p.active===false?" disabled":"")+'>'+(issued?"Rotate PIN":"Issue PIN")+'</button>'+
+      (p.pin_status==="active" && !self? '<button class="btn danger" id="mpRevoke">Revoke</button>' : '')+'</div>'+
+      (p.active===false? '<div class="sub" style="margin-top:6px">Enable this person before issuing a PIN.</div>' : '')+'</div>'+
+    (self? "" :
+      '<div class="adm-card" style="margin-top:12px"><b style="font-size:14px">Access</b>'+
+      '<div class="sub" style="margin-top:4px">'+(p.active===false
+        ? "Disabled: every sign-in is refused, on every device, whatever their PIN says."
+        : "Disabling signs them out everywhere immediately and refuses every later sign-in. Their audits, photos and scores are untouched — this is the safe way to remove somebody mid-event.")+'</div>'+
+      '<div class="btnrow" style="margin-bottom:0"><button class="btn'+(p.active===false?"":" danger")+'" id="mpActive">'+(p.active===false? "Enable this person" : "Disable this person")+'</button>'+
+      '<button class="btn" id="mpDelete">Delete from roster…</button></div></div>')});
+
+  const body=document.getElementById("adminSheetBody"), err=document.getElementById("mpErr");
+  const show=m=>{ err.textContent=m; err.hidden=false; };
+  body.querySelectorAll("#mpRole button").forEach(b=> b.addEventListener("click", ()=>{ if(b.disabled) return; role=b.dataset.role; body.querySelectorAll("#mpRole button").forEach(x=>x.setAttribute("aria-pressed", x===b)); document.getElementById("mpTeamWrap").hidden=(role!=="member"); }));
+  body.querySelectorAll("#mpTeam button").forEach(b=> b.addEventListener("click", ()=>{ team=+b.dataset.team; body.querySelectorAll("#mpTeam button").forEach(x=>x.setAttribute("aria-pressed", x===b)); }));
+  document.getElementById("mpCancel").addEventListener("click", ()=>closeAll());
+
+  async function after(msg){ await loadPeople(true); await reloadSnapshot(); toast(msg); closeAll(); if(adminActive()) renderAdmin(); }
+  document.getElementById("mpSave").addEventListener("click", async ()=>{
+    const name=(document.getElementById("mpName").value||"").trim();
+    if(name.length<2){ show("Enter a name"); return; }
+    if(role==="member" && !team){ show("Members need a team"); return; }
+    if(adminOffline()) return;
+    if(role==="member" && p.role==="member" && team!==p.team_id){
+      const ok=await adminConfirm({title:"Move "+p.name+" to "+esc(teamShort(team))+"?", body:"Their doors become that team's route. Audits they already scored stay with "+teamShort(p.team_id)+" — scores never move with a person.", okLabel:"Move"});
+      if(!ok) return;
+    }
+    const btn=document.getElementById("mpSave"); if(btn) btn.disabled=true;
+    try{ await Store.rpc("update_person", {person_id:p.person_id, name, role, team_id: role==="member"? team : null, reason:"edited in admin"}); await after("Saved"); }
+    catch(e){ if(btn) btn.disabled=false; show(friendlyErr(e, "Couldn’t save")); }
+  });
+  const lead=document.getElementById("mpLead");
+  if(lead) lead.addEventListener("click", async ()=>{
+    if(adminOffline()) return;
+    try{ await Store.rpc("set_team_lead", {team_id:p.team_id, person_id: p.is_lead? null : p.person_id, reason:"set in admin"}); await after(p.is_lead? p.name+" is no longer the lead" : p.name+" is now the team lead"); }
+    catch(e){ toast(friendlyErr(e, "Couldn’t set the lead")); }
+  });
+  body.querySelectorAll("#mpLevel button").forEach(b=> b.addEventListener("click", async ()=>{
+    if(b.disabled || b.getAttribute("aria-pressed")==="true") return;
+    if(adminOffline()) return;
+    try{ await Store.rpc("set_admin_level", {person_id:p.person_id, level:b.dataset.level, reason:"changed in admin"}); await after(p.name+" is now "+(b.dataset.level==="owner"? "an owner" : "a plain admin")); }
+    catch(e){ toast(friendlyErr(e, "Couldn’t change the level")); }
+  }));
+  document.getElementById("mpIssue").addEventListener("click", ()=>{ closeAll(); issuePinFlow(p, issued); });
+  const rev=document.getElementById("mpRevoke");
+  if(rev) rev.addEventListener("click", ()=>{ closeAll(); revokeFlow(p); });
+  const act=document.getElementById("mpActive");
+  if(act) act.addEventListener("click", async ()=>{
+    const next=p.active===false;
+    if(!next){
+      const ok=await adminConfirm({title:"Disable "+p.name+"?", body:"They are signed out on every device right away and cannot sign in again until you enable them. Their audits, photos and scores are untouched.", okLabel:"Disable", danger:true});
+      if(!ok) return;
+    }
+    if(adminOffline()) return;
+    try{ await Store.rpc("set_person_active", {person_id:p.person_id, active:next, reason: next? "enabled in admin" : "disabled in admin"}); await after(next? p.name+" enabled" : p.name+" disabled and signed out"); }
+    catch(e){ toast(friendlyErr(e, "Couldn’t change access")); }
+  });
+  const del=document.getElementById("mpDelete");
+  if(del) del.addEventListener("click", async ()=>{
+    const ok=await adminConfirm({title:"Delete "+p.name+" from the roster?", body:"This is refused if they have scored anything — disable them instead, which keeps every audit attributed to its author.", okLabel:"Delete", danger:true});
+    if(!ok) return;
+    if(adminOffline()) return;
+    try{ await Store.rpc("delete_person", {person_id:p.person_id, reason:"deleted in admin"}); await after(p.name+" deleted"); }
+    catch(e){ toast(friendlyErr(e, "Couldn’t delete")); }
+  });
 }
 function renderAdminPeople(el){
   if(ADMIN_PEOPLE===null && !adminPeopleErr) loadPeople();
@@ -2133,6 +2322,166 @@ function renderAdminPeople(el){
       (g.rows.length? g.rows.map(personRow).join("") : '<div class="note">No one here yet.</div>')+'</div>';
   });
   el.innerHTML=html;
+}
+
+/* ================= TEAMS (D-43) — create · edit · archive · delete · lead · membership =================
+   GROUPS only holds ACTIVE teams (applyConfig filters them), so this page reads the table directly: an
+   archived team has to stay visible here or there is no way to bring it back. Teams are ARCHIVED, never
+   deleted, while doors, people, audits or photos still point at them — a delete that cascaded would take
+   scored work with it. The hard delete is owner-only and the database refuses it unless nothing references
+   the team. Every write goes through an RPC so it lands in audit_log. */
+const TEAM_COLORS=["#2563EB","#7C3AED","#DB2777","#0F766E","#B45309","#475569"];
+let ADMIN_TEAMS=null, adminTeamsErr=null, adminTeamsLoading=false;
+async function loadTeams(force){
+  if(adminTeamsLoading || (ADMIN_TEAMS && !force)) return;
+  adminTeamsLoading=true; adminTeamsErr=null;
+  try{
+    const t=Store.table("teams");
+    if(t){ const {data,error}=await t.select("id,name,region,color,sort,active").order("sort"); if(error) throw error; ADMIN_TEAMS=data||[]; }
+    else ADMIN_TEAMS=Object.keys(GROUPS).map(id=>({id:+id, name:GROUPS[id].short, region:GROUPS[id].name, color:GROUPS[id].color, sort:+id, active:true}));
+  }catch(e){ console.error(e); adminTeamsErr=(e&&e.message)||"Couldn’t load teams"; }
+  finally{ adminTeamsLoading=false; if(adminActive() && adminPage==="teams") renderAdminPage(); }
+}
+/* A team write changes the door list every member sees, so the whole config snapshot is re-read rather
+   than patched locally — the same path a fresh load takes. */
+async function reloadSnapshot(){
+  try{ const r=await Store.loadConfig(); CONFIG_SOURCE=r.source; applyConfig(r.snap); }catch(e){}
+}
+function teamStats(id){
+  const people=(ADMIN_PEOPLE||[]).filter(p=>p.role==="member" && p.team_id===id);
+  return {members:people, lead:people.find(p=>p.is_lead)||null, doors:DOORS.filter(d=>d.team===id).length};
+}
+function renderAdminTeams(el){
+  if(ADMIN_TEAMS===null && !adminTeamsErr) loadTeams();
+  if(ADMIN_PEOPLE===null && !adminPeopleErr) loadPeople();
+  let html='<div class="adm-toolbar"><div class="grow"><h3 style="font-size:19px">Teams</h3>'+
+    '<div class="sub">Create, rename and retire teams · set the team lead · move members between teams</div></div>'+
+    '<button class="btn primary" data-act="teamNew">+ New team</button></div>';
+  if(!Store.online()) html+='<div class="note" style="margin:-4px 0 12px">Offline demo — teams are read from the built-in snapshot and cannot be changed.</div>';
+  if(adminTeamsErr) html+='<div class="adm-card"><h3>Couldn’t load teams</h3><div class="sub" style="margin-top:4px">'+esc(adminTeamsErr)+'</div><div class="btnrow" style="margin-bottom:0"><button class="btn" data-act="retryTeams" style="flex:0 0 auto">Retry</button></div></div>';
+  else if(ADMIN_TEAMS===null) html+='<div class="adm-card"><div class="skel" style="width:40%"></div><div class="skel"></div><div class="skel" style="width:70%"></div></div>';
+  else if(!ADMIN_TEAMS.length) html+='<div class="adm-card"><div class="note">No teams yet. Create the first one — its doors are assigned in the seed.</div></div>';
+  else ADMIN_TEAMS.slice().sort((a,b)=>(a.sort||a.id)-(b.sort||b.id)||a.id-b.id).forEach(t=>{
+    const st=teamStats(t.id), off=t.active===false;
+    html+='<div class="adm-card'+(off?' inactive':'')+'"><div class="ghead"><span class="dot" style="background:'+esc(t.color||"var(--muted)")+'"></span>'+
+      '<b>'+esc(t.name||("Team "+t.id))+'</b>'+(off?'<span class="pill todo">Archived</span>':'')+
+      '<span class="cnt">'+esc(t.region||"no region")+' · #'+t.id+'</span></div>'+
+      '<div class="prow"><div class="who"><b>'+st.doors+' door'+(st.doors===1?'':'s')+' · '+st.members.length+' member'+(st.members.length===1?'':'s')+'</b>'+
+        '<div class="m">'+(st.lead? '<span class="pill info">Lead · '+esc(st.lead.name)+'</span>'+
+          /* Being the lead issues nobody a PIN — and a lead who cannot sign in cannot release a door their
+             team-mate is stuck in, which is the whole point of the role. */
+          (st.lead.pin_status!=="active"? '<span class="pill part"><span class="pd"></span>lead has no PIN</span>' : '')
+          : '<span class="pill todo">No lead set</span>')+
+        (st.members.length? '<span>'+esc(st.members.slice(0,6).map(m=>m.name).join(", "))+(st.members.length>6? " +"+(st.members.length-6) : "")+'</span>' : '')+
+        '</div></div>'+
+        '<div class="acts"><button class="btn" data-act="teamMembers" data-tid="'+t.id+'">Members &amp; lead</button>'+
+        '<button class="btn" data-act="teamEdit" data-tid="'+t.id+'">Edit</button></div></div></div>';
+  });
+  el.innerHTML=html;
+}
+ADMIN_PAGES.teams.render=renderAdminTeams;
+ADMIN_PAGES.teams.title="Teams";
+ADMIN_ACTIONS.retryTeams=function(){ adminTeamsErr=null; loadTeams(true); renderAdminPage(); };
+ADMIN_ACTIONS.teamNew=function(){ openTeamSheet(null); };
+ADMIN_ACTIONS.teamEdit=function(el){ openTeamSheet((ADMIN_TEAMS||[]).find(t=>t.id===+el.dataset.tid)||null); };
+ADMIN_ACTIONS.teamMembers=function(el){ openTeamMembers(+el.dataset.tid); };
+
+function openTeamSheet(team){
+  const isNew=!team;
+  let color=(team&&team.color)||TEAM_COLORS[((ADMIN_TEAMS||[]).length)%TEAM_COLORS.length];
+  const st=team? teamStats(team.id) : {members:[], doors:0};
+  const refs=team? (st.doors+st.members.length) : 0;
+  adminSheet({title:isNew? "New team" : "Edit "+(team.name||("Team "+team.id)), sub:isNew? "The next free number is assigned automatically" : "Team #"+team.id, html:
+    '<div class="fld2"><label for="tmName">Name</label><input id="tmName" type="text" autocomplete="off" maxlength="40" placeholder="Team 4" value="'+esc((team&&team.name)||"")+'"></div>'+
+    '<div class="fld2"><label for="tmRegion">Region</label><input id="tmRegion" type="text" autocomplete="off" maxlength="60" placeholder="Metn / Keserwan" value="'+esc((team&&team.region)||"")+'"></div>'+
+    '<div class="sub" style="margin:-6px 0 12px">Shown under the team name everywhere, including the PDF report.</div>'+
+    '<div class="fld2"><label>Colour</label><div class="seg" id="tmColor">'+TEAM_COLORS.map(c=>'<button type="button" data-color="'+c+'" aria-pressed="'+(c===color)+'"><span class="dot" style="background:'+c+'"></span></button>').join("")+'</div></div>'+
+    '<div class="fld2"><label for="tmSort">Order</label><input id="tmSort" type="text" inputmode="numeric" value="'+esc(String((team&&team.sort)||((ADMIN_TEAMS||[]).length+1)))+'"></div>'+
+    '<div class="pinerr" id="tmErr" hidden></div>'+
+    '<div class="btnrow"><button class="btn" id="tmCancel">Cancel</button><button class="btn primary" id="tmSave">'+(isNew?"Create team":"Save team")+'</button></div>'+
+    (isNew? "" :
+      '<div class="adm-card" style="margin-top:14px"><b style="font-size:14px">Retire this team</b>'+
+      '<div class="sub" style="margin-top:4px">'+(refs>0
+        ? 'Archiving hides it from the app and from new assignments while keeping its '+st.doors+' door'+(st.doors===1?'':'s')+' and '+st.members.length+' member'+(st.members.length===1?'':'s')+', and every score already earned. This is the one you want mid-event.'
+        : 'Nothing points at this team, so it can be removed for good. Archiving hides it but keeps the record.')+'</div>'+
+      '<div class="btnrow" style="margin-bottom:0">'+
+        (team.active===false? '<button class="btn" id="tmRestore">Restore team</button>' : '<button class="btn" id="tmArchive">Archive team</button>')+
+        '<button class="btn danger" id="tmDelete"'+((refs>0||!adminIsOwner())?" disabled":"")+'>Delete team</button></div>'+
+      (refs>0? '<div class="sub" style="margin-top:6px">Move its doors and members elsewhere first, or archive it instead.</div>'
+             : (!adminIsOwner()? '<div class="sub" style="margin-top:6px">Only an owner can delete a team.</div>' : ''))+
+      '</div>')});
+  const body=document.getElementById("adminSheetBody");
+  body.querySelectorAll("#tmColor button").forEach(b=> b.addEventListener("click", ()=>{ color=b.dataset.color; body.querySelectorAll("#tmColor button").forEach(x=>x.setAttribute("aria-pressed", x===b)); }));
+  document.getElementById("tmCancel").addEventListener("click", ()=>closeAll());
+  const err=document.getElementById("tmErr"), show=m=>{ err.textContent=m; err.hidden=false; };
+  async function save(active){
+    const name=(document.getElementById("tmName").value||"").trim();
+    if(name.length<2){ show("Enter a name"); return; }
+    if(adminOffline()) return;
+    const btn=document.getElementById("tmSave"); btn.disabled=true; err.hidden=true;
+    try{
+      await Store.rpc("upsert_team", {team_id: isNew? null : team.id, name, region:(document.getElementById("tmRegion").value||"").trim()||null,
+        color, sort:+(document.getElementById("tmSort").value||0)||null, active: active===undefined? (team? team.active!==false : true) : active});
+      await loadTeams(true); await reloadSnapshot();
+      toast(isNew? "Team created" : "Team saved"); closeAll(); renderAdmin();
+    }catch(e){ btn.disabled=false; show(friendlyErr(e, "Couldn’t save the team")); }
+  }
+  document.getElementById("tmSave").addEventListener("click", ()=>save());
+  const arch=document.getElementById("tmArchive");
+  if(arch) arch.addEventListener("click", async ()=>{
+    const ok=await adminConfirm({title:"Archive "+team.name+"?", body:"It disappears from the app and from new assignments, and keeps every door, member and score it already has.", okLabel:"Archive"});
+    if(!ok) return;
+    if(adminOffline()) return;
+    try{ await Store.rpc("archive_team", {team_id:team.id, reason:"archived in admin"}); await loadTeams(true); await reloadSnapshot(); toast("Team archived"); renderAdmin(); }
+    catch(e){ toast(friendlyErr(e, "Couldn’t archive")); }
+  });
+  const rest=document.getElementById("tmRestore");
+  if(rest) rest.addEventListener("click", ()=>save(true));
+  const del=document.getElementById("tmDelete");
+  if(del) del.addEventListener("click", async ()=>{
+    const ok=await adminConfirm({title:"Delete "+team.name+" for good?", body:"This cannot be undone. The database refuses it if anything still points at the team.", okLabel:"Delete team", danger:true});
+    if(!ok) return;
+    if(adminOffline()) return;
+    try{ await Store.rpc("delete_team", {team_id:team.id, reason:"deleted in admin"}); await loadTeams(true); await reloadSnapshot(); toast("Team deleted"); renderAdmin(); }
+    catch(e){ toast(friendlyErr(e, "Couldn’t delete")); }
+  });
+}
+
+function openTeamMembers(tid){
+  const team=(ADMIN_TEAMS||[]).find(t=>t.id===tid); if(!team) return;
+  const st=teamStats(tid);
+  const others=(ADMIN_PEOPLE||[]).filter(p=>p.role==="member" && p.team_id!==tid);
+  adminSheet({title:team.name||("Team "+tid), sub:st.members.length+" member"+(st.members.length===1?"":"s")+(st.lead? " · lead "+st.lead.name : " · no lead set"), html:
+    '<div class="eyebrow" style="margin-top:8px">Team lead</div>'+
+    '<div class="sub" style="margin:4px 0 8px">The lead normally taps <b>Start visit</b> and is the only member who can release a door another member is holding. Everyone else audits exactly as before.</div>'+
+    (st.members.filter(m=>m.active!==false).length
+      ? st.members.filter(m=>m.active!==false).map(m=>'<button class="btn js-lead" data-pid="'+esc(m.person_id)+'" data-on="'+(m.is_lead?1:0)+'" style="width:100%;justify-content:space-between;margin-bottom:6px">'+
+          '<span>'+esc(m.name)+(m.is_lead? ' — lead, tap to clear' : '')+'</span>'+(m.pin_status!=="active"? '<span class="pill part"><span class="pd"></span>No PIN</span>' : '')+'</button>').join("")
+        + (st.lead && st.lead.pin_status!=="active"? '<div class="warnnote" style="margin-top:6px">'+esc(st.lead.name)+' has no active PIN, so they cannot sign in to use any of this. Making somebody the lead never issues one — do that in People &amp; PINs.</div>' : '')
+      : '<div class="note">Nobody enabled in this team yet.</div>')+
+    '<div class="eyebrow" style="margin-top:14px">Members</div>'+
+    (st.members.length? st.members.map(m=>'<div class="prow"><div class="who"><b>'+esc(m.name)+(m.is_lead?'<span class="pill info">Lead</span>':'')+(m.active===false?'<span class="pill todo">Disabled</span>':'')+'</b>'+
+        '<div class="m">'+pinPill(m.pin_status)+'</div></div>'+
+        '<div class="acts"><button class="btn js-manage" data-pid="'+esc(m.person_id)+'">Manage</button></div></div>').join("")
+      : '<div class="note">Nobody in this team yet.</div>')+
+    (others.length? '<div class="eyebrow" style="margin-top:14px">Move somebody in</div>'+
+      others.map(o=>'<button class="btn js-movein" data-pid="'+esc(o.person_id)+'" style="width:100%;justify-content:space-between;margin-bottom:6px">'+esc(o.name)+'<span class="sub">'+esc(teamShort(o.team_id))+'</span></button>').join("") : "")+
+    '<div class="sub" style="margin-top:12px">Moving somebody changes the doors they see. Audits they already scored stay with the team that did the work — scores never travel with a person.</div>'});
+  const body=document.getElementById("adminSheetBody");
+  body.querySelectorAll(".js-lead").forEach(b=> b.addEventListener("click", async ()=>{
+    if(adminOffline()) return;
+    try{ await Store.rpc("set_team_lead", {team_id:tid, person_id: b.dataset.on==="1"? null : b.dataset.pid, reason:"set from Teams"});
+      await loadPeople(true); await reloadSnapshot(); toast(b.dataset.on==="1"? "Team lead cleared" : "Team lead set"); openTeamMembers(tid); }
+    catch(e){ toast(friendlyErr(e, "Couldn’t set the lead")); }
+  }));
+  body.querySelectorAll(".js-movein").forEach(b=> b.addEventListener("click", async ()=>{
+    const p=personById(b.dataset.pid); if(!p) return;
+    if(adminOffline()) return;
+    try{ await Store.rpc("update_person", {person_id:p.person_id, name:p.name, role:"member", team_id:tid, reason:"moved from Teams"});
+      await loadPeople(true); await reloadSnapshot(); toast(p.name+" moved"); openTeamMembers(tid); }
+    catch(e){ toast(friendlyErr(e, "Couldn’t move them")); }
+  }));
+  body.querySelectorAll(".js-manage").forEach(b=> b.addEventListener("click", ()=>{ const p=personById(b.dataset.pid); if(p) openManagePerson(p); }));
 }
 
 /* ---- PIN issue / rotate / revoke / add — plaintext PIN exists only in the RPC call and the one-time sheet ---- */
@@ -2162,6 +2511,21 @@ function whatsappMessage(p, pin){
              : "You're signed in as "+(p.role==="admin"? "an Admin" : "a Supervisor")+".";
   return "Hi "+p.name+" — Field Cup, "+eventDateLabel()+": open "+appLink()+" and enter your PIN "+pin+". "+where;
 }
+/* D-44 — record THAT a PIN was handed over, never what it was. Best-effort on purpose: a failed marker must
+   never make an admin think the PIN did not go out. */
+async function markDelivered(personId){ try{ await Store.rpc("mark_code_delivered", {person_id:personId}); }catch(e){} }
+/* Hand the message over the way the device can: the OS share sheet on a phone (WhatsApp is one tap from
+   there), the clipboard everywhere else. Returns false only when the person dismissed the share sheet. */
+async function sharePinMessage(person, text){
+  if(navigator.share){
+    try{ await navigator.share({title:"Field Cup", text}); markDelivered(person.person_id); toast("Sent to "+person.name); return true; }
+    catch(e){ if(e && e.name==="AbortError") return false; }
+  }
+  const ok=await copyText(text);
+  if(ok) markDelivered(person.person_id);
+  toast(ok? "Copied ✓ — paste into WhatsApp" : "Couldn’t copy — long-press the message to select it");
+  return ok;
+}
 function showPinSheet(items, opts){   // items: [{person, pin, expires_at} | {person, error}] — locked until "Done — sent"; opts.afterDone runs once it closes
   const ok=items.filter(i=>i.pin), failed=items.filter(i=>!i.pin);
   let html="";
@@ -2172,16 +2536,28 @@ function showPinSheet(items, opts){   // items: [{person, pin, expires_at} | {pe
   } else if(ok.length>1) html+='<div class="note">'+ok.length+' PINs issued. Copy all messages at once, or one at a time.</div>';
   ok.forEach((i,idx)=>{
     html+='<div class="msgbox" style="margin-top:10px" id="pinMsg'+idx+'">'+esc(whatsappMessage(i.person, i.pin))+'</div>'+
-      (ok.length>1? '<button class="btn js-copy1" data-idx="'+idx+'" style="margin-top:6px;width:auto;padding:8px 12px;font-size:12.5px">Copy for '+esc(i.person.name)+'</button>' : '');
+      '<div class="btnrow" style="margin:6px 0 0">'+
+        '<button class="btn js-share1" data-idx="'+idx+'" style="padding:8px 12px;font-size:12.5px">Share'+(ok.length>1? " to "+esc(i.person.name) : "")+'</button>'+
+        '<a class="btn js-wa" href="'+esc("https://wa.me/?text="+encodeURIComponent(whatsappMessage(i.person, i.pin)))+'" target="_blank" rel="noopener" data-idx="'+idx+'" style="padding:8px 12px;font-size:12.5px">WhatsApp</a>'+
+      '</div>';
   });
   failed.forEach(i=>{ html+='<div class="msgbox" style="margin-top:10px;color:var(--bad)">'+esc(i.person.name)+': '+esc(i.error||"failed")+'</div>'; });
   if(ok.length) html+='<div class="warnnote">This is the only time the PIN'+(ok.length>1?'s are':' is')+' shown. Once you close this sheet '+(ok.length>1?'they':'it')+' cannot be recovered — you would have to Rotate.</div>';
-  html+='<div class="btnrow">'+(ok.length? '<button class="btn primary" id="pinCopyAll">Copy '+(ok.length>1?'all messages':'message')+'</button>' : '')+'<button class="btn" id="pinDone">Done — sent</button></div>';
+  html+='<div class="btnrow">'+(ok.length? '<button class="btn primary" id="pinCopyAll">Copy '+(ok.length>1?'all messages':'message')+'</button>' : '')+
+    (ok.length>1? '<button class="btn" id="pinPrint">Print</button>' : '')+'<button class="btn" id="pinDone">Done — sent</button></div>';
   adminSheet({title: ok.length>1? ok.length+" new PINs" : (ok.length? "New PIN" : "PINs not issued"), sub: ok.length? "Send on WhatsApp now" : "", html, lock:!!ok.length});
   const body=document.getElementById("adminSheetBody");
   const ca=document.getElementById("pinCopyAll");
-  if(ca) ca.addEventListener("click", async ()=>{ const t=ok.map(i=>whatsappMessage(i.person,i.pin)).join("\n\n"); toast((await copyText(t))? "Copied ✓ — paste into WhatsApp" : "Couldn’t copy — long-press the message to select it"); });
-  body.querySelectorAll(".js-copy1").forEach(b=> b.addEventListener("click", async ()=>{ const i=ok[+b.dataset.idx]; toast((await copyText(whatsappMessage(i.person,i.pin)))? "Copied ✓" : "Couldn’t copy — long-press the message"); }));
+  if(ca) ca.addEventListener("click", async ()=>{
+    const t=ok.map(i=>whatsappMessage(i.person,i.pin)).join("\n\n");
+    const done=await copyText(t);
+    if(done) ok.forEach(i=>markDelivered(i.person.person_id));
+    toast(done? "Copied ✓ — paste into WhatsApp" : "Couldn’t copy — long-press the message to select it");
+  });
+  const pp=document.getElementById("pinPrint");
+  if(pp) pp.addEventListener("click", ()=>{ ok.forEach(i=>markDelivered(i.person.person_id)); window.print(); });
+  body.querySelectorAll(".js-share1").forEach(b=> b.addEventListener("click", ()=>{ const i=ok[+b.dataset.idx]; sharePinMessage(i.person, whatsappMessage(i.person, i.pin)); }));
+  body.querySelectorAll(".js-wa").forEach(a=> a.addEventListener("click", ()=>{ const i=ok[+a.dataset.idx]; markDelivered(i.person.person_id); }));
   document.getElementById("pinDone").addEventListener("click", ()=>{ adminSheetFinish(); if(opts && typeof opts.afterDone==="function") opts.afterDone(); });
 }
 function isSelf(person){ return !!(ME && ME.personId && person && person.person_id===ME.personId); }
@@ -2232,30 +2608,77 @@ async function bulkIssueFlow(group){   // "Copy all messages for a team": issue 
 function openAddPerson(){
   const teams=Object.keys(GROUPS); let role="member", team= teams.length? +teams[0] : null;
   adminSheet({title:"Add person", sub:"Appears in the roster right away; a PIN lets them log in.", html:
-    '<div class="fld2"><label for="apName">Name</label><input id="apName" type="text" autocomplete="off" maxlength="60" placeholder="First name, as they’re known on WhatsApp"></div>'+
+    '<div class="fld2"><label for="apName">Name</label><textarea id="apName" rows="3" autocomplete="off" placeholder="One name per line — paste a whole team at once:&#10;Leen&#10;Elise&#10;Hassan"></textarea>'+
+      '<div class="sub" id="apCount" style="margin-top:4px">One per line, or separated by commas.</div></div>'+
     '<div class="fld2"><label>Role</label><div class="seg" id="apRole">'+["member","supervisor","admin"].map(r=>'<button type="button" data-role="'+r+'" aria-pressed="'+(r===role)+'">'+roleLabel(r)+'</button>').join("")+'</div></div>'+
+    /* A supervisor or an admin is almost always somebody already on the roster being promoted, not a new
+       face. For a team member it is the other way round, so the picker only shows for the other two. */
+    '<div id="apPromoteWrap"'+(role==="member"?" hidden":"")+'><div class="adm-card" style="margin-bottom:12px"><b style="font-size:14px">Promote somebody already here</b>'+
+      '<div class="sub" style="margin-top:4px">They keep their name and their PIN, leave their team and stop being a team lead.</div>'+
+      '<input id="apFind" type="text" autocomplete="off" placeholder="Search the roster…" style="margin-top:8px">'+
+      '<div id="apPromoteList" style="max-height:230px;overflow-y:auto;margin-top:8px"></div></div></div>'+
     '<div class="fld2" id="apTeamWrap"><label>Team</label><div class="seg" id="apTeam">'+teams.map(t=>'<button type="button" data-team="'+t+'" aria-pressed="'+(+t===team)+'"><span class="dot" style="background:'+esc(GROUPS[t].color)+'"></span>'+esc(GROUPS[t].short)+'</button>').join("")+'</div></div>'+
     '<label class="chk"><input type="checkbox" id="apIssue" checked> Issue a PIN right away</label>'+
     '<div class="pinerr" id="apErr" hidden></div>'+
     '<div class="btnrow"><button class="btn" id="apCancel">Cancel</button><button class="btn primary" id="apSave">Add person</button></div>'});
   const body=document.getElementById("adminSheetBody");
-  body.querySelectorAll("#apRole button").forEach(b=> b.addEventListener("click", ()=>{ role=b.dataset.role; body.querySelectorAll("#apRole button").forEach(x=>x.setAttribute("aria-pressed", x===b)); document.getElementById("apTeamWrap").hidden=(role!=="member"); }));
+  function renderPromote(){
+    const wrap=document.getElementById("apPromoteWrap"); if(!wrap) return;
+    wrap.hidden = (role==="member");
+    const nameLbl=document.querySelector('label[for="apName"]');
+    if(nameLbl) nameLbl.textContent = role==="member"? "Name" : "…or add a new person";
+    if(role==="member") return;
+    const q=((document.getElementById("apFind")||{}).value||"").trim().toLowerCase();
+    const list=(ADMIN_PEOPLE||[]).filter(p=>p.role!==role && p.active!==false && (!q || p.name.toLowerCase().indexOf(q)>=0));
+    document.getElementById("apPromoteList").innerHTML = list.length
+      ? list.map(p=>'<button type="button" class="btn js-promote" data-pid="'+esc(p.person_id)+'" style="width:100%;justify-content:space-between;margin-bottom:6px">'+
+          '<span>'+esc(p.name)+'</span><span class="sub">'+esc(roleLabel(p.role))+(p.role==="member"? " · "+esc(teamShort(p.team_id)) : "")+(p.is_lead?" · lead":"")+'</span></button>').join("")
+      : '<div class="note" style="margin:0">'+(q? "Nobody matches that." : "Everybody already has this role.")+'</div>';
+    document.getElementById("apPromoteList").querySelectorAll(".js-promote").forEach(b=> b.addEventListener("click", async ()=>{
+      const p=personById(b.dataset.pid); if(!p) return;
+      const where = p.role==="member"? teamShort(p.team_id) : roleLabel(p.role);
+      const ok=await adminConfirm({title:"Make "+p.name+" "+(role==="admin"? "an admin" : "a supervisor")+"?",
+        okLabel:"Promote",
+        body:"They leave "+where+(p.is_lead? " and stop being its team lead" : "")+". Their PIN keeps working, and the change reaches their phone without a re-login."});
+      if(!ok) return;
+      if(adminOffline()) return;
+      try{ await Store.rpc("update_person", {person_id:p.person_id, name:p.name, role, team_id:null, reason:"promoted in admin"});
+        await loadPeople(true); await reloadSnapshot(); toast(p.name+" is now "+(role==="admin"? "an admin" : "a supervisor")); closeAll(); if(adminActive()) renderAdmin(); }
+      catch(e){ toast(friendlyErr(e, "Couldn’t promote")); }
+    }));
+  }
+  body.querySelectorAll("#apRole button").forEach(b=> b.addEventListener("click", ()=>{ role=b.dataset.role; body.querySelectorAll("#apRole button").forEach(x=>x.setAttribute("aria-pressed", x===b)); document.getElementById("apTeamWrap").hidden=(role!=="member"); renderPromote(); }));
+  const findBox=document.getElementById("apFind");
+  if(findBox) findBox.addEventListener("input", renderPromote);
+  renderPromote();
   body.querySelectorAll("#apTeam button").forEach(b=> b.addEventListener("click", ()=>{ team=+b.dataset.team; body.querySelectorAll("#apTeam button").forEach(x=>x.setAttribute("aria-pressed", x===b)); }));
   document.getElementById("apCancel").addEventListener("click", ()=>closeAll());
+  const nameBox=document.getElementById("apName"), countEl=document.getElementById("apCount");
+  const namesFrom=v=> String(v||"").split(/[\n,]/).map(x=>x.trim()).filter(Boolean);
+  nameBox.addEventListener("input", ()=>{
+    const list=namesFrom(nameBox.value);
+    countEl.textContent = list.length? list.length+(list.length===1?" person: ":" people: ")+list.join(", ") : "One per line, or separated by commas.";
+  });
   document.getElementById("apSave").addEventListener("click", async ()=>{
-    const name=(document.getElementById("apName").value||"").trim(), err=document.getElementById("apErr");
+    const list=namesFrom(nameBox.value), err=document.getElementById("apErr");
     const show=m=>{ err.textContent=m; err.hidden=false; };
-    if(name.length<2){ show("Enter a name"); return; }
+    if(!list.length || list.some(n=>n.length<2)){ show("Enter a name on each line"); return; }
     if(role==="member" && !team){ show("Members need a team"); return; }
     if(adminOffline()) return;
     const btn=document.getElementById("apSave"); btn.disabled=true; err.hidden=true;
+    const issue=document.getElementById("apIssue").checked, made=[], failed=[];
     try{
-      const id=await Store.rpc("add_person", {name, role, team_id: role==="member"? team : null});
-      const person={person_id:id, name, role, team_id: role==="member"? team : null, pin_status:"not_issued"};
-      const issue=document.getElementById("apIssue").checked;
+      for(const name of list){
+        try{
+          const id=await Store.rpc("add_person", {name, role, team_id: role==="member"? team : null});
+          const person={person_id:id, name, role, team_id: role==="member"? team : null, pin_status:"not_issued"};
+          if(issue){ const r=await issuePin(person); made.push({person, pin:r.pin, expires_at:r.res.expires_at}); }
+        }catch(e){ failed.push(name+" ("+((e&&e.message)||"failed").slice(0,50)+")"); }
+      }
       loadPeople(true);
-      if(issue){ const r=await issuePin(person); showPinSheet([{person, pin:r.pin, expires_at:r.res.expires_at}]); }
-      else { toast("Added "+name); closeAll(); }
+      if(failed.length) toast("Could not add: "+failed.join(", "));
+      if(made.length) showPinSheet(made);
+      else { toast(list.length-failed.length? "Added "+(list.length-failed.length) : "Nothing was added"); closeAll(); }
     }catch(e){ console.error(e && e.message); btn.disabled=false; show(friendlyErr(e, "Couldn’t add")); }
   });
   setTimeout(()=>{ try{ document.getElementById("apName").focus(); }catch(e){} }, 250);
@@ -2265,6 +2688,7 @@ ADMIN_ACTIONS.retryPeople=function(){ adminPeopleErr=null; ADMIN_PEOPLE=null; lo
 ADMIN_ACTIONS.issue=function(el){ const p=personById(el.dataset.pid); if(!p){ toast("Person not found — refresh"); return; } return issuePinFlow(p, el.dataset.rotate==="1"); };
 ADMIN_ACTIONS.revoke=function(el){ const p=personById(el.dataset.pid); if(!p){ toast("Person not found — refresh"); return; } return revokeFlow(p); };
 ADMIN_ACTIONS.bulkIssue=function(el){ const g=peopleGroups().find(x=>x.key===el.dataset.group); if(!g) return; return bulkIssueFlow(g); };
+ADMIN_ACTIONS.manage=function(el){ const p=personById(el.dataset.pid); if(!p){ toast("Person not found — refresh"); return; } return openManagePerson(p); };
 
 /* ---- Event settings (12-ADMIN §2, FR-49) — form bound to config.event (+ features.dark_mode); status machine Draft → Ready → Live → Closed ----
    Draft lives in ADMIN_EVENT_DRAFT until Save/Discard so navigating away and back keeps unsaved edits. live=false: realtime never redraws over the form. */
@@ -2278,6 +2702,10 @@ const EV_STATUS_DESC={
 const EV_TZ=["Asia/Beirut","Asia/Dubai","Asia/Riyadh","Europe/Paris","Europe/London","UTC"];
 const EV_TEXT_FIELDS=["name","subtitle","cluster_label","date","tz","session_expires_at"];
 const EV_BOOL_FIELDS=["allow_custom_team_name","members_can_view_other_teams","show_leaderboard","show_photo_wall"];
+/* D-45 — door claims default OFF, unlike every flag above: applying 005 must not change what a member can
+   do until an admin turns it on deliberately, after the dry run. `claim_ttl_min` defaults to 30 because the
+   worked example is a 20-minute door, and a shorter window would drop the claim of somebody still working. */
+const EV_BOOL_OFF=["door_claims"];
 let ADMIN_EVENT_DRAFT=null, adminEventSaving=false, adminEventBlockers=null;   // blockers: null | {to, items:[{ok, label, list}]}
 
 function adminConfigLocked(){ return eventStatus()==="live"; }   // Teams/Doors/Form/Scoring pages: refuse edits while Live (RPCs enforce server-side too)
@@ -2290,6 +2718,8 @@ function evDraftFromCfg(){
   const ev=CFG.event||{}, d={theme:evThemeCurrent()};
   EV_TEXT_FIELDS.forEach(k=>{ d[k]= ev[k]==null? "" : String(ev[k]); });
   EV_BOOL_FIELDS.forEach(k=>{ d[k]= ev[k]!==false; });
+  EV_BOOL_OFF.forEach(k=>{ d[k]= ev[k]===true; });
+  d.claim_ttl_min= +ev.claim_ttl_min>0? +ev.claim_ttl_min : 30;
   d.pin_length= +ev.pin_length===8? 8 : 6;
   return d;
 }
@@ -2312,6 +2742,8 @@ function evMergedEvent(d){   // config.event value to persist: keep keys the for
   const ev=Object.assign({}, CFG.event||{});
   EV_TEXT_FIELDS.forEach(k=>{ const v=String(d[k]||"").trim(); if(k==="session_expires_at"){ if(v) ev[k]=v; else delete ev[k]; } else ev[k]=v; });
   EV_BOOL_FIELDS.forEach(k=>{ ev[k]=!!d[k]; });
+  EV_BOOL_OFF.forEach(k=>{ ev[k]=!!d[k]; });
+  ev.claim_ttl_min=Math.min(120, Math.max(1, Math.round(+d.claim_ttl_min)||30));
   ev.pin_length=d.pin_length===8? 8 : 6;
   return ev;
 }
@@ -2383,6 +2815,12 @@ function renderAdminEvent(el){
       chk("show_leaderboard","Show leaderboard to members","Off = hidden until the reveal; admins and supervisors still see it.")+
       chk("show_photo_wall","Show photo wall to members")+
     '</div>'+
+    /* The only setting on this page that changes what a member can DO, so it says so plainly. */
+    '<div class="adm-card"><h3>Door claims</h3><div class="sub" style="margin-bottom:12px">Stops two people from auditing the same shop at the same time.</div>'+
+      chk("door_claims","One person per door","Tapping Start audit holds that door for that person. A team-mate sees who is in it and cannot write to it until they finish. Supervisors and admins are never blocked.")+
+      (d.door_claims? evField("claim_ttl_min","Release a door after", evTextInput(d,"claim_ttl_min","text",err.claim_ttl_min), err.claim_ttl_min,
+        "Minutes with no activity. A flat battery or a closed shop must not lock a door for the rest of the day, so a quiet claim expires on its own — the team lead and any admin can also release one from Live Monitor.") : "")+
+    '</div>'+
     '<div class="adm-card"><h3>Appearance</h3><div class="sub" style="margin-bottom:12px">Theme for every device. Logo upload comes after the event.</div>'+
       evField("theme","Theme", seg("theme",[["light","Light"],["dark","Dark"],["system","System"]]))+
     '</div>'+
@@ -2404,6 +2842,9 @@ function evOnInput(ev){
   if(t.type==="checkbox") evSetField(k, !!t.checked);
   else if(k==="session_expires_at") evSetField(k, evLocalToIso(t.value));
   else evSetField(k, t.value);
+  // door_claims reveals its own follow-up field, so this one toggle needs the page back — nothing is being
+  // typed into a checkbox, so redrawing cannot steal focus mid-word.
+  if(k==="door_claims"){ renderAdminPage(); return; }
   evRefreshSaveBar(k);
 }
 function evRefreshSaveBar(k){   // cheap partial update while typing: dirty pill + Save button + the field's own error, never a full redraw (keeps focus)
@@ -2646,7 +3087,14 @@ ADMIN_ACTIONS.dataPdfs=function(){ return runDataExport("pdfs"); };
 ADMIN_ACTIONS.dataAll=function(){ return runDataExport("all"); };
 
 /* wipe: typed exact event name; disabled while Live; RPC enforces both server-side */
-function wipeBlockReason(){ if(adminConfigLocked()) return "Event is Live — set status to Ready or Closed on the Event page first."; if(adminDataBusy) return "Wait for the running export to finish."; return null; }
+function wipeBlockReason(){
+  /* D-42 — wiping is owner-only. wipe_event_data refuses a plain admin server-side too; this is the message
+     that says why, instead of a raw permission error after the event name has been typed out in full. */
+  if(!adminIsOwner()) return "Only an owner can wipe event data. Ask whoever holds the owner level on this console.";
+  if(adminConfigLocked()) return "Event is Live — set status to Ready or Closed on the Event page first.";
+  if(adminDataBusy) return "Wait for the running export to finish.";
+  return null;
+}
 function syncWipeButton(){
   const inp=document.getElementById("wipeName"), btn=document.getElementById("wipeBtn"), why=document.getElementById("wipeWhy"); if(!inp||!btn) return;
   const reason=wipeBlockReason(), match= inp.value===String((CFG.event&&CFG.event.name)||"");
