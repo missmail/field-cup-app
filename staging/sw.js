@@ -3,7 +3,7 @@
    Bump CACHE_VERSION on every deploy that changes index.html or the libs. */
 'use strict';
 
-const CACHE_VERSION = 'fc-v1.1.1';
+const CACHE_VERSION = 'fc-v1.1.2';   // D-50: 21 Sep route (25 doors) + sales contact
 const SHELL_CACHE   = CACHE_VERSION + '-shell';
 const FONT_CACHE    = CACHE_VERSION + '-fonts';
 
